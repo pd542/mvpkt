@@ -48,15 +48,20 @@ android {
         getDefaultProguardFile("proguard-android-optimize.txt"),
         "proguard-rules.pro",
       )
+      // Default to the Android debug keystore so CI/GitHub Releases produce
+      // installable APKs without requiring SIGNING_* secrets.
+      // Production builds can re-sign with r0adkll/sign-android-release in CI.
+      signingConfig = signingConfigs.getByName("debug")
     }
     create("preview") {
       initWith(getByName("release"))
 
-      signingConfig = signingConfigs["debug"]
+      signingConfig = signingConfigs.getByName("debug")
       applicationIdSuffix = ".preview"
       versionNameSuffix = "-${getCommitCount()}"
     }
     named("debug") {
+      signingConfig = signingConfigs.getByName("debug")
       applicationIdSuffix = ".debug"
       versionNameSuffix = "-${getCommitCount()}"
     }

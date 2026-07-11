@@ -1,6 +1,6 @@
 name: Release
 
-# Build APKs and publish a GitHub Release.
+# Build signed APKs and publish a GitHub Release.
 #
 # Triggers:
 #   - Push a tag matching v*  (e.g. git tag v0.1.7 && git push origin v0.1.7)
@@ -12,8 +12,8 @@ name: Release
 #   SIGNING_STORE_PASSWORD
 #   KEY_PASSWORD
 #
-# Without those secrets the workflow still publishes installable APKs signed
-# with the Android debug keystore (marked as debug-signed in the notes).
+# Without those secrets, APKs are signed with the Android debug keystore
+# (still fully installable on phones). Never publish unsigned APKs.
 
 permissions:
   contents: write
@@ -64,7 +64,6 @@ jobs:
           else
             TAG="${GITHUB_REF#refs/tags/}"
           fi
-          # normalize: ensure leading v
           if [[ ! "$TAG" =~ ^v ]]; then
             TAG="v${TAG}"
           fi
@@ -87,27 +86,23 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      - name: Detect signing secrets
+      - name: Detect production signing secrets
         id: signing
         shell: bash
         run: |
           if [[ -n "${{ secrets.SIGNING_KEYSTORE }}" && -n "${{ secrets.SIGNING_KEY_ALIAS }}" && -n "${{ secrets.SIGNING_STORE_PASSWORD }}" && -n "${{ secrets.KEY_PASSWORD }}" ]]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
-            echo "Signing secrets present — will produce production-signed release APKs."
+            echo "Production signing secrets present."
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "Signing secrets missing — will produce debug-signed installable APKs."
+            echo "No production secrets — APKs will use debug keystore (installable)."
           fi
 
-      - name: Build release APKs
-        if: steps.signing.outputs.available == 'true'
+      # release buildType is debug-signed by default in build.gradle.kts
+      - name: Build release APKs (debug-signed by Gradle)
         run: ./gradlew --no-daemon assembleRelease
 
-      - name: Build preview APKs (debug-signed fallback)
-        if: steps.signing.outputs.available != 'true'
-        run: ./gradlew --no-daemon assemblePreview
-
-      - name: Sign release APKs
+      - name: Re-sign with production keystore
         if: steps.signing.outputs.available == 'true'
         uses: r0adkll/sign-android-release@v1
         with:
@@ -119,7 +114,7 @@ jobs:
         env:
           BUILD_TOOLS_VERSION: "35.0.0"
 
-      - name: Collect artifacts
+      - name: Collect & verify signed artifacts
         id: artifacts
         shell: bash
         run: |
@@ -127,40 +122,65 @@ jobs:
           TAG="${{ steps.meta.outputs.safe_tag }}"
           mkdir -p dist
           APIS=("universal" "arm64-v8a" "armeabi-v7a" "x86" "x86_64")
+          SRC_DIR="app/build/outputs/apk/release"
+          ls -la "${SRC_DIR}" || true
 
           if [[ "${{ steps.signing.outputs.available }}" == "true" ]]; then
-            SRC_DIR="app/build/outputs/apk/release"
-            # signed files from r0adkll are typically *-unsigned-signed.apk
-            for abi in "${APIS[@]}"; do
-              src=$(ls "${SRC_DIR}"/app-"${abi}"-release*signed*.apk 2>/dev/null | head -n1 || true)
-              if [[ -z "${src}" ]]; then
-                src=$(ls "${SRC_DIR}"/app-"${abi}"-release*.apk 2>/dev/null | head -n1 || true)
-              fi
-              if [[ -z "${src}" ]]; then
-                echo "Missing APK for ${abi} under ${SRC_DIR}"
-                ls -la "${SRC_DIR}" || true
-                exit 1
-              fi
-              out="dist/mpvKt-${abi}-${TAG}.apk"
-              cp "${src}" "${out}"
-              echo "collected ${out} from ${src}"
-            done
-            SIGNING_NOTE="Signed with repository release keystore."
+            SIGNING_NOTE="Signed with repository production keystore."
+            SUFFIX=""
           else
-            SRC_DIR="app/build/outputs/apk/preview"
-            for abi in "${APIS[@]}"; do
-              src=$(ls "${SRC_DIR}"/app-"${abi}"-preview*.apk 2>/dev/null | head -n1 || true)
-              if [[ -z "${src}" ]]; then
-                echo "Missing preview APK for ${abi} under ${SRC_DIR}"
-                ls -la "${SRC_DIR}" || true
-                exit 1
-              fi
-              out="dist/mpvKt-${abi}-${TAG}-debug-signed.apk"
-              cp "${src}" "${out}"
-              echo "collected ${out} from ${src}"
-            done
-            SIGNING_NOTE="⚠️ No SIGNING_* secrets configured. APKs are **debug-signed** (applicationId suffix \`.preview\`). Installable for testing; not a Play Store release."
+            SIGNING_NOTE="Signed with **Android debug keystore** (installable for sideload testing). Not a Play Store release key. To use your own key, add SIGNING_KEYSTORE / SIGNING_KEY_ALIAS / SIGNING_STORE_PASSWORD / KEY_PASSWORD secrets."
+            SUFFIX="-debug-signed"
           fi
+
+          for abi in "${APIS[@]}"; do
+            # Prefer re-signed outputs from r0adkll, then normal signed release APKs.
+            # Never pick *unsigned*.
+            src=""
+            for cand in \
+              "${SRC_DIR}/app-${abi}-release-unsigned-signed.apk" \
+              "${SRC_DIR}/app-${abi}-release-signed.apk" \
+              "${SRC_DIR}/app-${abi}-release.apk"
+            do
+              if [[ -f "$cand" ]]; then src="$cand"; break; fi
+            done
+            # fallback: any matching apk that is not unsigned
+            if [[ -z "$src" ]]; then
+              src=$(ls "${SRC_DIR}"/app-"${abi}"-release*.apk 2>/dev/null | grep -v unsigned | head -n1 || true)
+            fi
+            if [[ -z "$src" || ! -f "$src" ]]; then
+              echo "ERROR: missing signed APK for ${abi}"
+              ls -la "${SRC_DIR}" || true
+              exit 1
+            fi
+            if [[ "$src" == *unsigned* && "$src" != *signed* ]]; then
+              echo "ERROR: refusing to ship unsigned APK: $src"
+              exit 1
+            fi
+            out="dist/mpvKt-${abi}-${TAG}${SUFFIX}.apk"
+            cp "$src" "$out"
+            echo "collected $out from $src"
+
+            # Verify APK has a signature (jarsigner or apksigner)
+            if command -v apksigner >/dev/null 2>&1; then
+              apksigner verify --print-certs "$out" >/tmp/verify.out 2>&1 || {
+                echo "apksigner verify failed for $out"; cat /tmp/verify.out; exit 1;
+              }
+            else
+              # Android SDK build-tools path
+              ASIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n1 || true)
+              if [[ -n "$ASIGNER" ]]; then
+                "$ASIGNER" verify --print-certs "$out" >/tmp/verify.out 2>&1 || {
+                  echo "apksigner verify failed for $out"; cat /tmp/verify.out; exit 1;
+                }
+              else
+                jarsigner -verify -certs "$out" >/tmp/verify.out 2>&1 || {
+                  echo "jarsigner verify failed for $out"; cat /tmp/verify.out; exit 1;
+                }
+              fi
+            fi
+            echo "verified signature: $out"
+          done
 
           {
             echo "### Checksums"
@@ -169,16 +189,17 @@ jobs:
             echo "| ------- | ---- | ------- |"
             for f in dist/*.apk; do
               base=$(basename "$f")
-              # variant between mpvKt- and -v / -debug
               variant=$(echo "$base" | sed -E 's/^mpvKt-//; s/-v.*//; s/-debug-signed\.apk$//')
               sha=$(sha256sum "$f" | awk '{print $1}')
               echo "| ${variant} | \`${base}\` | \`${sha}\` |"
             done
           } > dist/CHECKSUMS.md
 
-          echo "signing_note<<EOF" >> "$GITHUB_OUTPUT"
-          echo "${SIGNING_NOTE}" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          {
+            echo "signing_note<<EOF"
+            echo "${SIGNING_NOTE}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
           ls -lh dist/
 
@@ -187,7 +208,6 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ steps.meta.outputs.safe_tag }}"
-          # lightweight source archive (exclude git / build caches)
           tar -czf "dist/mpvKt-source-${TAG}.tar.gz" \
             --exclude='.git' \
             --exclude='**/build' \
@@ -197,7 +217,6 @@ jobs:
           ls -lh "dist/mpvKt-source-${TAG}.tar.gz"
 
       - name: Build release notes
-        id: notes
         shell: bash
         run: |
           set -euo pipefail
@@ -205,24 +224,19 @@ jobs:
           cat > dist/RELEASE_BODY.md <<EOF
           ## mpvKt ${TAG}
 
-          Enhanced Android media player based on [mpvKt](https://github.com/abdallahmehiz/mpvKt) / libmpv.
+          Enhanced Android media player (local + network streaming) with configurable cache / threads.
 
-          ### Highlights
-          - Local media + network streaming (HTTP / HLS / …)
-          - Configurable demuxer cache size & readahead time
-          - Configurable video / audio decoder threads
-          - Streaming reconnect optimizations
+          ### Install
+          1. Download **arm64-v8a** APK on modern phones (or **universal** if unsure).
+          2. Allow install from unknown sources.
+          3. Open the APK — it is **signed** (debug key unless production secrets are configured).
 
-          See \`ENHANCEMENTS.md\` in the source tarball for option mapping.
+          Do **not** install files named \`*-unsigned.apk\`.
 
           ${{ steps.artifacts.outputs.signing_note }}
 
           $(cat dist/CHECKSUMS.md)
-
-          ### Install tip
-          Prefer **arm64-v8a** on modern phones; use **universal** if unsure.
           EOF
-          echo "body_path=dist/RELEASE_BODY.md" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
