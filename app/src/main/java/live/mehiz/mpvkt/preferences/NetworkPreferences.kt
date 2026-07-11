@@ -75,7 +75,9 @@ class NetworkPreferences(preferenceStore: PreferenceStore) {
    * Serves a local proxy URL to mpv while N connections fill a sparse cache.
    * No effect on HLS/DASH (m3u8) or servers without Accept-Ranges.
    */
-  val multiConnectionDownload = preferenceStore.getBoolean("network_multi_connection_download", true)
+  // Default OFF (new key so old installs don't keep a broken "true").
+  // Enable only after normal playback works. Failed accel must not break play.
+  val multiConnectionDownload = preferenceStore.getBoolean("network_multi_connection_download_v2", false)
 
   /** Parallel connections for multi-connection download (2–16). */
   val multiConnectionCount = preferenceStore.getInt("network_multi_connection_count", 8)

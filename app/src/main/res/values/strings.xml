@@ -147,7 +147,7 @@
     <string name="pref_network_tip_summary">Decoder threads do NOT speed up download. For progressive HTTP(S) files, enable Multi-connection download (Range) to pull many chunks in parallel like a browser/IDM. HLS/m3u8 is not accelerated that way. Re-open the video after changing settings.</string>
     <string name="pref_network_category_multiconn">Multi-connection download</string>
     <string name="pref_network_multi_connection">Multi-connection download (Range)</string>
-    <string name="pref_network_multi_connection_summary">Parallel HTTP Range requests + local proxy. Speeds up progressive mp4/mkv/… when the server allows Range. Not for HLS/m3u8.</string>
+    <string name="pref_network_multi_connection_summary">Optional. Parallel HTTP Range + local proxy for progressive mp4/mkv when the server allows Range. Default off — turn on only if normal play works. Not for HLS/m3u8. If play fails, turn this off.</string>
     <string name="pref_network_multi_connection_count">Parallel connections</string>
     <string name="pref_network_multi_connection_chunk">Chunk size</string>
     <string name="pref_network_prefer_highest_bandwidth">Prefer highest HLS bitrate</string>

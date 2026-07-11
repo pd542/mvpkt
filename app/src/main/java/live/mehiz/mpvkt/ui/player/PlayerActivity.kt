@@ -141,9 +141,14 @@ class PlayerActivity : AppCompatActivity() {
 
   private fun loadMediaFromIntent(intent: Intent, useLoadfileCommand: Boolean = false) {
     lifecycleScope.launch {
+      // Resolve path quickly; multi-conn probe is optional and time-bounded.
       val playable = withContext(Dispatchers.IO) {
-        getPlayableUri(intent)
+        runCatching { getPlayableUri(intent) }.getOrElse { error ->
+          Log.e(TAG, "getPlayableUri failed: ${error.message}", error)
+          parsePathFromIntent(intent)
+        }
       } ?: return@launch
+      Log.i(TAG, "Loading media: $playable")
       if (useLoadfileCommand) {
         MPVLib.command("loadfile", playable)
       } else {
@@ -159,13 +164,15 @@ class PlayerActivity : AppCompatActivity() {
     } else {
       uri
     }
-    return resolved?.let(::maybeAccelerateHttp)
+    // Never let acceleration exceptions block playback.
+    return resolved?.let { source ->
+      runCatching { maybeAccelerateHttp(source) }.getOrDefault(source)
+    }
   }
 
   /**
-   * If multi-connection download is enabled and the URL is a progressive HTTP(S)
-   * file that supports Range, start parallel chunk download + local proxy and
-   * return `http://127.0.0.1:port/...` for mpv. Otherwise return [uri] unchanged.
+   * Optional multi-connection Range download. Returns a localhost proxy only when
+   * the first bytes are ready; otherwise returns [uri] unchanged so mpv uses the origin.
    */
   private fun maybeAccelerateHttp(uri: String): String {
     val enabled = networkPreferences.multiConnectionDownload.get() &&
@@ -174,7 +181,6 @@ class PlayerActivity : AppCompatActivity() {
       return uri
     }
 
-    // Replace any previous session when loading a new file.
     segmentedHttpCache?.close()
     segmentedHttpCache = null
 
@@ -187,14 +193,15 @@ class PlayerActivity : AppCompatActivity() {
       chunkBytes = chunkKb * 1024,
     )
     val local = accelerator.open(uri)
-    if (local != uri) {
+    return if (local != uri && local.startsWith("http://127.0.0.1")) {
       segmentedHttpCache = accelerator
-      Log.i(TAG, "Multi-connection accelerate: $uri → $local ($connections conn, ${chunkKb}KiB)")
+      Log.i(TAG, "Multi-connection ON: $uri → $local ($connections x ${chunkKb}KiB)")
+      local
     } else {
       accelerator.close()
-      Log.i(TAG, "Multi-connection not used for: $uri")
+      Log.i(TAG, "Multi-connection OFF/pass-through for: $uri")
+      uri
     }
-    return local
   }
 
   override fun onDestroy() {
