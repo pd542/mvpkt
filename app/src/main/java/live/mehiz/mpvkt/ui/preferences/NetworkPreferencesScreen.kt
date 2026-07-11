@@ -23,6 +23,7 @@ import live.mehiz.mpvkt.preferences.NetworkPreferences
 import live.mehiz.mpvkt.preferences.preference.collectAsState
 import live.mehiz.mpvkt.presentation.Screen
 import live.mehiz.mpvkt.ui.utils.LocalBackStack
+import me.zhanghai.compose.preference.Preference
 import me.zhanghai.compose.preference.PreferenceCategory
 import me.zhanghai.compose.preference.ProvidePreferenceLocals
 import me.zhanghai.compose.preference.SliderPreference
@@ -58,6 +59,11 @@ object NetworkPreferencesScreen : Screen {
         ) {
           PreferenceCategory(
             title = { Text(stringResource(R.string.pref_network_category_cache)) },
+          )
+          // Static tip: threads ≠ download speed
+          Preference(
+            title = { Text(stringResource(R.string.pref_network_tip_title)) },
+            summary = { Text(stringResource(R.string.pref_network_tip_summary)) },
           )
 
           val demuxerMaxCacheMb by preferences.demuxerMaxCacheMb.collectAsState()
@@ -278,6 +284,22 @@ object NetworkPreferencesScreen : Screen {
               preferences.streamBufferSizeKb.set(value.roundToInt().coerceIn(16, 2048))
             },
             sliderValue = streamBufferSizeKbFloat,
+          )
+
+          val preferHighestBandwidth by preferences.preferHighestBandwidth.collectAsState()
+          SwitchPreference(
+            value = preferHighestBandwidth,
+            onValueChange = preferences.preferHighestBandwidth::set,
+            title = { Text(stringResource(R.string.pref_network_prefer_highest_bandwidth)) },
+            summary = { Text(stringResource(R.string.pref_network_prefer_highest_bandwidth_summary)) },
+          )
+
+          val demuxerSeekableCache by preferences.demuxerSeekableCache.collectAsState()
+          SwitchPreference(
+            value = demuxerSeekableCache,
+            onValueChange = preferences.demuxerSeekableCache::set,
+            title = { Text(stringResource(R.string.pref_network_demuxer_seekable_cache)) },
+            summary = { Text(stringResource(R.string.pref_network_demuxer_seekable_cache_summary)) },
           )
 
           val tlsVerify by preferences.tlsVerify.collectAsState()
