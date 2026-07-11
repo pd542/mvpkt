@@ -186,8 +186,9 @@ class PlayerActivity : AppCompatActivity() {
   }
 
   /**
-   * Optional multi-connection Range download. Returns a localhost proxy only when
-   * the first bytes are ready; otherwise returns [uri] unchanged so mpv uses the origin.
+   * Optional multi-connection Range download.
+   * Returns a **local file path** when segmented mode is active (mpv-safe),
+   * otherwise the original remote URL.
    */
   private fun maybeAccelerateHttp(uri: String): String {
     if (!SegmentedHttpCache.isAcceleratableUrl(uri)) {
@@ -198,21 +199,24 @@ class PlayerActivity : AppCompatActivity() {
     segmentedHttpCache = null
 
     val connections = networkPreferences.multiConnectionCount.get().coerceIn(2, 16)
-    val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 8192)
+    val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 4096)
     val cacheRoot = File(cacheDir, "segmented-http").also { it.mkdirs() }
     val accelerator = SegmentedHttpCache(
       cacheDir = cacheRoot,
       connections = connections,
       chunkBytes = chunkKb * 1024,
     )
-    val local = accelerator.open(uri)
-    return if (local != uri && local.startsWith("http://127.0.0.1")) {
+    val result = accelerator.open(uri)
+    return if (result.usedSegmented) {
       segmentedHttpCache = accelerator
-      Log.i(TAG, "Multi-connection ON: $uri → $local ($connections x ${chunkKb}KiB)")
-      local
+      Log.i(
+        TAG,
+        "Segmented ON: $uri → ${result.playPath} ($connections x ${chunkKb}KiB)",
+      )
+      result.playPath
     } else {
       accelerator.close()
-      Log.i(TAG, "Multi-connection OFF/pass-through for: $uri")
+      Log.i(TAG, "Segmented pass-through (direct): $uri")
       uri
     }
   }

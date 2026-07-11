@@ -1,8 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Allow cleartext only to localhost for the multi-connection media proxy. -->
+<!-- Allow cleartext to localhost for the multi-connection media proxy (libmpv + app). -->
 <network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="true">127.0.0.1</domain>
         <domain includeSubdomains="true">localhost</domain>
+        <domain includeSubdomains="true">::1</domain>
     </domain-config>
 </network-security-config>
