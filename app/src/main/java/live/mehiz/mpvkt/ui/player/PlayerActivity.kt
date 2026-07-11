@@ -48,13 +48,16 @@ import `is`.xyz.mpv.Utils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import live.mehiz.mpvkt.database.entities.CustomButtonEntity
 import live.mehiz.mpvkt.database.entities.PlaybackStateEntity
 import live.mehiz.mpvkt.databinding.PlayerLayoutBinding
 import live.mehiz.mpvkt.domain.playbackstate.repository.PlaybackStateRepository
+import live.mehiz.mpvkt.network.SegmentedHttpCache
 import live.mehiz.mpvkt.preferences.AdvancedPreferences
 import live.mehiz.mpvkt.preferences.AudioPreferences
 import live.mehiz.mpvkt.preferences.GesturePreferences
+import live.mehiz.mpvkt.preferences.NetworkPreferences
 import live.mehiz.mpvkt.preferences.PlayerPreferences
 import live.mehiz.mpvkt.preferences.SubtitlesPreferences
 import live.mehiz.mpvkt.ui.player.controls.PlayerControls
@@ -78,11 +81,14 @@ class PlayerActivity : AppCompatActivity() {
   private val subtitlesPreferences: SubtitlesPreferences by inject()
   private val advancedPreferences: AdvancedPreferences by inject()
   private val gesturePreferences: GesturePreferences by inject()
+  private val networkPreferences: NetworkPreferences by inject()
   private val fileManager: FileManager by inject()
 
   private var fileName = ""
   private var mediaPlaybackService: MediaPlaybackService? = null
   private var serviceBound = false
+  /** Multi-connection Range downloader + local proxy (progressive HTTP only). */
+  private var segmentedHttpCache: SegmentedHttpCache? = null
 
   private var audioFocusRequest: AudioFocusRequestCompat? = null
   private var restoreAudioFocus: () -> Unit = {}
@@ -115,7 +121,8 @@ class PlayerActivity : AppCompatActivity() {
     setupMPV()
     setupAudio()
     setupMediaSession()
-    getPlayableUri(intent)?.let(player::playFile)
+    // Multi-connection probe does network I/O — never on the main thread.
+    loadMediaFromIntent(intent)
     setOrientation()
 
     binding.controls.setContent {
@@ -131,9 +138,59 @@ class PlayerActivity : AppCompatActivity() {
     }
   }
 
+  private fun loadMediaFromIntent(intent: Intent, useLoadfileCommand: Boolean = false) {
+    lifecycleScope.launch {
+      val playable = withContext(Dispatchers.IO) {
+        getPlayableUri(intent)
+      } ?: return@launch
+      if (useLoadfileCommand) {
+        MPVLib.command("loadfile", playable)
+      } else {
+        player.playFile(playable)
+      }
+    }
+  }
+
   private fun getPlayableUri(intent: Intent): String? {
     val uri = parsePathFromIntent(intent)
-    return if (uri?.startsWith("content://") == true) uri.toUri().openContentFd(this) else uri
+    val resolved = if (uri?.startsWith("content://") == true) {
+      uri.toUri().openContentFd(this)
+    } else {
+      uri
+    }
+    return resolved?.let(::maybeAccelerateHttp)
+  }
+
+  /**
+   * If multi-connection download is enabled and the URL is a progressive HTTP(S)
+   * file that supports Range, start parallel chunk download + local proxy and
+   * return `http://127.0.0.1:port/...` for mpv. Otherwise return [uri] unchanged.
+   */
+  private fun maybeAccelerateHttp(uri: String): String {
+    if (!networkPreferences.multiConnectionDownload.get()) return uri
+    if (!SegmentedHttpCache.isAcceleratableUrl(uri)) return uri
+
+    // Replace any previous session when loading a new file.
+    segmentedHttpCache?.close()
+    segmentedHttpCache = null
+
+    val connections = networkPreferences.multiConnectionCount.get().coerceIn(2, 16)
+    val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 8192)
+    val cacheRoot = File(cacheDir, "segmented-http").also { it.mkdirs() }
+    val accelerator = SegmentedHttpCache(
+      cacheDir = cacheRoot,
+      connections = connections,
+      chunkBytes = chunkKb * 1024,
+    )
+    val local = accelerator.open(uri)
+    if (local != uri) {
+      segmentedHttpCache = accelerator
+      Log.i(TAG, "Multi-connection accelerate: $uri → $local ($connections conn, ${chunkKb}KiB chunks)")
+    } else {
+      accelerator.close()
+      Log.i(TAG, "Multi-connection not used for: $uri")
+    }
+    return local
   }
 
   override fun onDestroy() {
@@ -154,6 +211,8 @@ class PlayerActivity : AppCompatActivity() {
     }
     MPVLib.removeObserver(playerObserver)
     MPVLib.destroy()
+    segmentedHttpCache?.close()
+    segmentedHttpCache = null
 
     super.onDestroy()
   }
@@ -633,9 +692,11 @@ class PlayerActivity : AppCompatActivity() {
 
   override fun onNewIntent(intent: Intent) {
     super.onNewIntent(intent)
-
-    getPlayableUri(intent)?.let { MPVLib.command("loadfile", it) }
     setIntent(intent)
+    // Close previous multi-conn session before opening a new URL.
+    segmentedHttpCache?.close()
+    segmentedHttpCache = null
+    loadMediaFromIntent(intent, useLoadfileCommand = true)
   }
 
   @RequiresApi(Build.VERSION_CODES.O)

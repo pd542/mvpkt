@@ -109,7 +109,12 @@
     <string name="pref_network_tls_verify">校验证书（TLS）</string>
     <string name="pref_network_tls_verify_summary">仅在使用自签名证书的串流时关闭</string>
     <string name="pref_network_tip_title">关于缓存速度</string>
-    <string name="pref_network_tip_summary">「解码线程数」不会加快下载。想缓冲更多、减少卡顿：提高「前向解复用缓存」「缓存预读时间」「最大缓存时长」「流缓冲大小」。改完后需重新打开视频。实际填充速度取决于网速和服务器，无法用多线程突破带宽上限。</string>
+    <string name="pref_network_tip_summary">「解码线程数」不会加快下载。对普通 HTTP(S) 整文件（mp4/mkv 等），请开启「多连接分片下载」：用多个 Range 连接并行拉取，类似浏览器/IDM。HLS/m3u8 无法用这种方式加速。改设置后需重新打开视频。</string>
+    <string name="pref_network_category_multiconn">多连接分片下载</string>
+    <string name="pref_network_multi_connection">多连接分片下载（Range）</string>
+    <string name="pref_network_multi_connection_summary">并行 HTTP Range + 本地代理边下边播。服务器支持断点续传时，可明显加快 mp4/mkv 等整文件缓冲。不支持 HLS/m3u8。</string>
+    <string name="pref_network_multi_connection_count">并行连接数</string>
+    <string name="pref_network_multi_connection_chunk">分片大小</string>
     <string name="pref_network_prefer_highest_bandwidth">优先最高 HLS 码率</string>
     <string name="pref_network_prefer_highest_bandwidth_summary">自适应流（HLS）时选择最高清晰度档，更耗流量</string>
     <string name="pref_network_demuxer_seekable_cache">可跳转的解复用缓存</string>

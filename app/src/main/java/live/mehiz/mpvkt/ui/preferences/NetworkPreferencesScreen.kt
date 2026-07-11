@@ -286,6 +286,54 @@ object NetworkPreferencesScreen : Screen {
             sliderValue = streamBufferSizeKbFloat,
           )
 
+          PreferenceCategory(
+            title = { Text(stringResource(R.string.pref_network_category_multiconn)) },
+          )
+
+          val multiConnectionDownload by preferences.multiConnectionDownload.collectAsState()
+          SwitchPreference(
+            value = multiConnectionDownload,
+            onValueChange = preferences.multiConnectionDownload::set,
+            title = { Text(stringResource(R.string.pref_network_multi_connection)) },
+            summary = { Text(stringResource(R.string.pref_network_multi_connection_summary)) },
+          )
+
+          val multiConnectionCount by preferences.multiConnectionCount.collectAsState()
+          val multiConnectionCountFloat = multiConnectionCount.toFloat()
+          SliderPreference(
+            value = multiConnectionCountFloat,
+            onValueChange = { value ->
+              preferences.multiConnectionCount.set(value.roundToInt().coerceIn(2, 16))
+            },
+            title = { Text(stringResource(R.string.pref_network_multi_connection_count)) },
+            valueRange = 2f..16f,
+            summary = {
+              Text(stringResource(R.string.pref_network_value_threads, multiConnectionCount))
+            },
+            onSliderValueChange = { value ->
+              preferences.multiConnectionCount.set(value.roundToInt().coerceIn(2, 16))
+            },
+            sliderValue = multiConnectionCountFloat,
+          )
+
+          val multiConnectionChunkKb by preferences.multiConnectionChunkKb.collectAsState()
+          val multiConnectionChunkKbFloat = multiConnectionChunkKb.toFloat()
+          SliderPreference(
+            value = multiConnectionChunkKbFloat,
+            onValueChange = { value ->
+              preferences.multiConnectionChunkKb.set(value.roundToInt().coerceIn(256, 8192))
+            },
+            title = { Text(stringResource(R.string.pref_network_multi_connection_chunk)) },
+            valueRange = 256f..8192f,
+            summary = {
+              Text(stringResource(R.string.pref_network_value_kb, multiConnectionChunkKb))
+            },
+            onSliderValueChange = { value ->
+              preferences.multiConnectionChunkKb.set(value.roundToInt().coerceIn(256, 8192))
+            },
+            sliderValue = multiConnectionChunkKbFloat,
+          )
+
           val preferHighestBandwidth by preferences.preferHighestBandwidth.collectAsState()
           SwitchPreference(
             value = preferHighestBandwidth,

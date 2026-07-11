@@ -69,4 +69,17 @@ class NetworkPreferences(preferenceStore: PreferenceStore) {
 
   /** Keep demuxer cache seekable for smoother seeking on network streams. */
   val demuxerSeekableCache = preferenceStore.getBoolean("network_demuxer_seekable_cache", true)
+
+  /**
+   * Multi-connection Range download (browser/IDM style) for progressive HTTP(S) files.
+   * Serves a local proxy URL to mpv while N connections fill a sparse cache.
+   * No effect on HLS/DASH (m3u8) or servers without Accept-Ranges.
+   */
+  val multiConnectionDownload = preferenceStore.getBoolean("network_multi_connection_download", true)
+
+  /** Parallel connections for multi-connection download (2–16). */
+  val multiConnectionCount = preferenceStore.getInt("network_multi_connection_count", 8)
+
+  /** Chunk size per Range request in KiB (256–8192). */
+  val multiConnectionChunkKb = preferenceStore.getInt("network_multi_connection_chunk_kb", 1024)
 }

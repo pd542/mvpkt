@@ -144,7 +144,12 @@
     <string name="pref_network_tls_verify">Verify TLS certificates</string>
     <string name="pref_network_tls_verify_summary">Disable only if your stream uses a self-signed certificate</string>
     <string name="pref_network_tip_title">About cache speed</string>
-    <string name="pref_network_tip_summary">Decoder threads do NOT speed up download. To buffer more / stutter less: raise Forward demuxer cache, Cache readahead time, Max cache duration, Stream buffer size. Re-open the video after changing. Fill rate is limited by your network and the server.</string>
+    <string name="pref_network_tip_summary">Decoder threads do NOT speed up download. For progressive HTTP(S) files, enable Multi-connection download (Range) to pull many chunks in parallel like a browser/IDM. HLS/m3u8 is not accelerated that way. Re-open the video after changing settings.</string>
+    <string name="pref_network_category_multiconn">Multi-connection download</string>
+    <string name="pref_network_multi_connection">Multi-connection download (Range)</string>
+    <string name="pref_network_multi_connection_summary">Parallel HTTP Range requests + local proxy. Speeds up progressive mp4/mkv/… when the server allows Range. Not for HLS/m3u8.</string>
+    <string name="pref_network_multi_connection_count">Parallel connections</string>
+    <string name="pref_network_multi_connection_chunk">Chunk size</string>
     <string name="pref_network_prefer_highest_bandwidth">Prefer highest HLS bitrate</string>
     <string name="pref_network_prefer_highest_bandwidth_summary">Pick the top quality rung when the stream is adaptive (HLS). Uses more bandwidth.</string>
     <string name="pref_network_demuxer_seekable_cache">Seekable demuxer cache</string>
