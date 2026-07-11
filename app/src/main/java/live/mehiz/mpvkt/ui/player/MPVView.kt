@@ -20,6 +20,7 @@ import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 import kotlin.reflect.KProperty
 
+@Suppress("TooManyFunctions")
 class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context, attributes), KoinComponent {
 
   private val audioPreferences: AudioPreferences by inject()
