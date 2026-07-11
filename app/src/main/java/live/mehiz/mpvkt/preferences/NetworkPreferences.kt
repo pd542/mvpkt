@@ -11,7 +11,7 @@ import live.mehiz.mpvkt.preferences.preference.PreferenceStore
  */
 class NetworkPreferences(preferenceStore: PreferenceStore) {
   /** Forward demuxer cache size in MiB (maps to demuxer-max-bytes). Main buffer capacity. */
-  val demuxerMaxCacheMb = preferenceStore.getInt("network_demuxer_max_cache_mb", 128)
+  val demuxerMaxCacheMb = preferenceStore.getInt("network_demuxer_max_cache_mb", 64)
 
   /** Backward demuxer cache size in MiB (maps to demuxer-max-back-bytes). */
   val demuxerMaxBackCacheMb = preferenceStore.getInt("network_demuxer_max_back_cache_mb", 64)
@@ -20,19 +20,19 @@ class NetworkPreferences(preferenceStore: PreferenceStore) {
    * How many seconds of media the demuxer should try to buffer ahead
    * (maps to demuxer-readahead-secs). Primary "how far ahead to cache" control.
    */
-  val demuxerReadaheadSecs = preferenceStore.getInt("network_demuxer_readahead_secs", 30)
+  val demuxerReadaheadSecs = preferenceStore.getInt("network_demuxer_readahead_secs", 10)
 
   /**
    * Soft limit for the amount of data kept in the demuxer cache in seconds
    * (maps to cache-secs / demuxer-max-bytes interaction).
    */
-  val cacheSecs = preferenceStore.getInt("network_cache_secs", 120)
+  val cacheSecs = preferenceStore.getInt("network_cache_secs", 50)
 
   /** Pause playback until a small amount of cache is filled (cache-pause-initial). */
-  val cachePauseInitial = preferenceStore.getBoolean("network_cache_pause_initial", true)
+  val cachePauseInitial = preferenceStore.getBoolean("network_cache_pause_initial", false)
 
   /** Seconds of cache required before unpausing after underrun (cache-pause-wait). */
-  val cachePauseWaitSecs = preferenceStore.getInt("network_cache_pause_wait_secs", 3)
+  val cachePauseWaitSecs = preferenceStore.getInt("network_cache_pause_wait_secs", 1)
 
   /**
    * Video decoder thread count; 0 = auto (vd-lavc-threads).
@@ -58,14 +58,14 @@ class NetworkPreferences(preferenceStore: PreferenceStore) {
   /** Enable TLS verification for https streams. */
   val tlsVerify = preferenceStore.getBoolean("network_tls_verify", true)
 
-  /** Apply higher defaults tuned for network streams. */
-  val optimizeForNetwork = preferenceStore.getBoolean("network_optimize_for_streaming", true)
+  /** Apply higher defaults tuned for network streams. Default off — safer playback. */
+  val optimizeForNetwork = preferenceStore.getBoolean("network_optimize_for_streaming", false)
 
   /**
-   * Prefer highest HLS/DASH bandwidth ladder entry when available
-   * (hls-bitrate=max / similar lavf behaviour via stream options).
+   * Prefer highest HLS/DASH bandwidth ladder entry when available.
+   * Default off — can break some adaptive streams.
    */
-  val preferHighestBandwidth = preferenceStore.getBoolean("network_prefer_highest_bandwidth", true)
+  val preferHighestBandwidth = preferenceStore.getBoolean("network_prefer_highest_bandwidth", false)
 
   /** Keep demuxer cache seekable for smoother seeking on network streams. */
   val demuxerSeekableCache = preferenceStore.getBoolean("network_demuxer_seekable_cache", true)

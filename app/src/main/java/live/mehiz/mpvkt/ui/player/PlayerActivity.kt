@@ -122,8 +122,9 @@ class PlayerActivity : AppCompatActivity() {
     setupMPV()
     setupAudio()
     setupMediaSession()
-    // Multi-connection probe does network I/O — never on the main thread.
-    loadMediaFromIntent(intent)
+    // Default path matches upstream: resolve URI and play immediately on main thread.
+    // Multi-connection (optional) only runs on a background thread when explicitly enabled.
+    startPlayback(intent, useLoadfileCommand = false)
     setOrientation()
 
     binding.controls.setContent {
@@ -139,14 +140,28 @@ class PlayerActivity : AppCompatActivity() {
     }
   }
 
-  private fun loadMediaFromIntent(intent: Intent, useLoadfileCommand: Boolean = false) {
-    lifecycleScope.launch {
-      // Resolve path quickly; multi-conn probe is optional and time-bounded.
-      val playable = withContext(Dispatchers.IO) {
-        runCatching { getPlayableUri(intent) }.getOrElse { error ->
-          Log.e(TAG, "getPlayableUri failed: ${error.message}", error)
-          parsePathFromIntent(intent)
+  private fun startPlayback(intent: Intent, useLoadfileCommand: Boolean) {
+    val multiConn = networkPreferences.multiConnectionDownload.get()
+    if (!multiConn) {
+      // Fast path — identical to original mpvKt behaviour.
+      resolvePlayableUri(intent)?.let { uri ->
+        Log.i(TAG, "Loading media (direct): $uri")
+        if (useLoadfileCommand) {
+          MPVLib.command("loadfile", uri)
+        } else {
+          player.playFile(uri)
         }
+      }
+      return
+    }
+
+    lifecycleScope.launch {
+      val playable = withContext(Dispatchers.IO) {
+        runCatching { resolvePlayableUri(intent)?.let(::maybeAccelerateHttp) }
+          .getOrElse { error ->
+            Log.e(TAG, "accelerate failed: ${error.message}", error)
+            resolvePlayableUri(intent)
+          }
       } ?: return@launch
       Log.i(TAG, "Loading media: $playable")
       if (useLoadfileCommand) {
@@ -157,16 +172,13 @@ class PlayerActivity : AppCompatActivity() {
     }
   }
 
-  private fun getPlayableUri(intent: Intent): String? {
+  /** Resolve content/file/http URI without multi-connection. */
+  private fun resolvePlayableUri(intent: Intent): String? {
     val uri = parsePathFromIntent(intent)
-    val resolved = if (uri?.startsWith("content://") == true) {
+    return if (uri?.startsWith("content://") == true) {
       uri.toUri().openContentFd(this)
     } else {
       uri
-    }
-    // Never let acceleration exceptions block playback.
-    return resolved?.let { source ->
-      runCatching { maybeAccelerateHttp(source) }.getOrDefault(source)
     }
   }
 
@@ -175,9 +187,7 @@ class PlayerActivity : AppCompatActivity() {
    * the first bytes are ready; otherwise returns [uri] unchanged so mpv uses the origin.
    */
   private fun maybeAccelerateHttp(uri: String): String {
-    val enabled = networkPreferences.multiConnectionDownload.get() &&
-      SegmentedHttpCache.isAcceleratableUrl(uri)
-    if (!enabled) {
+    if (!SegmentedHttpCache.isAcceleratableUrl(uri)) {
       return uri
     }
 
@@ -707,7 +717,7 @@ class PlayerActivity : AppCompatActivity() {
     // Close previous multi-conn session before opening a new URL.
     segmentedHttpCache?.close()
     segmentedHttpCache = null
-    loadMediaFromIntent(intent, useLoadfileCommand = true)
+    startPlayback(intent, useLoadfileCommand = true)
   }
 
   @RequiresApi(Build.VERSION_CODES.O)

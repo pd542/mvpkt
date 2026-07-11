@@ -70,12 +70,12 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
     MPVLib.setPropertyBoolean("keep-open", true)
     MPVLib.setPropertyBoolean("input-default-bindings", true)
 
-    MPVLib.setOptionString(
-      "tls-verify",
-      if (networkPreferences.tlsVerify.get()) "yes" else "no",
-    )
+    // Keep TLS defaults identical to upstream mpvKt (safe for HTTPS streams).
+    MPVLib.setOptionString("tls-verify", "yes")
     MPVLib.setOptionString("tls-ca-file", "${context.filesDir.path}/cacert.pem")
 
+    // Safe demuxer cache only — do NOT inject experimental stream-lavf-o / hls options
+    // that can break ordinary HTTP/HLS playback on some CDNs.
     setupNetworkAndCacheOptions()
 
     val screenshotDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
@@ -94,47 +94,28 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
     setupAudioOptions()
   }
 
-  /** Cache capacity / readahead + decoder threads. Must run before loadfile. */
+  /**
+   * User-tunable demuxer cache + optional decoder threads.
+   * Intentionally conservative so normal network play always works.
+   */
   private fun setupNetworkAndCacheOptions() {
-    applyDemuxerCacheOptions()
-    applyDecoderThreadOptions()
-    applyStreamingOptions()
-  }
-
-  private fun applyDemuxerCacheOptions() {
     val forwardCacheBytes =
       networkPreferences.demuxerMaxCacheMb.get().coerceIn(8, 512) * 1024L * 1024L
     val backCacheBytes =
       networkPreferences.demuxerMaxBackCacheMb.get().coerceIn(8, 512) * 1024L * 1024L
+    // Same options upstream always set (with fixed 32/64 MiB).
     MPVLib.setOptionString("demuxer-max-bytes", forwardCacheBytes.toString())
     MPVLib.setOptionString("demuxer-max-back-bytes", backCacheBytes.toString())
-    MPVLib.setOptionString(
-      "demuxer-readahead-secs",
-      networkPreferences.demuxerReadaheadSecs.get().coerceIn(0, 120).toString(),
-    )
-    MPVLib.setOptionString(
-      "cache-secs",
-      networkPreferences.cacheSecs.get().coerceIn(1, 300).toString(),
-    )
-    MPVLib.setOptionString("cache", "yes")
-    MPVLib.setOptionString("demuxer-donate-buffer", "yes")
-    MPVLib.setOptionString(
-      "demuxer-seekable-cache",
-      if (networkPreferences.demuxerSeekableCache.get()) "yes" else "no",
-    )
-    MPVLib.setOptionString("demuxer-cache-wait", "no")
-    MPVLib.setOptionString("cache-pause", "yes")
-    MPVLib.setOptionString(
-      "cache-pause-initial",
-      if (networkPreferences.cachePauseInitial.get()) "yes" else "no",
-    )
-    MPVLib.setOptionString(
-      "cache-pause-wait",
-      networkPreferences.cachePauseWaitSecs.get().coerceIn(0, 30).toString(),
-    )
-  }
 
-  private fun applyDecoderThreadOptions() {
+    val readahead = networkPreferences.demuxerReadaheadSecs.get().coerceIn(0, 120)
+    if (readahead > 0) {
+      MPVLib.setOptionString("demuxer-readahead-secs", readahead.toString())
+    }
+
+    // Optional soft limits — omit aggressive cache-pause/stream-lavf overrides.
+    val cacheSecs = networkPreferences.cacheSecs.get().coerceIn(1, 300)
+    MPVLib.setOptionString("cache-secs", cacheSecs.toString())
+
     val vdThreads = networkPreferences.videoDecoderThreads.get().coerceIn(0, 16)
     if (vdThreads > 0) {
       MPVLib.setOptionString("vd-lavc-threads", vdThreads.toString())
@@ -143,39 +124,13 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
     if (adThreads > 0) {
       MPVLib.setOptionString("ad-lavc-threads", adThreads.toString())
     }
-    MPVLib.setOptionString(
-      "demuxer-thread",
-      if (networkPreferences.demuxerThread.get()) "yes" else "no",
-    )
-    MPVLib.setOptionString(
-      "prefetch-playlist",
-      if (networkPreferences.prefetchPlaylist.get()) "yes" else "no",
-    )
-  }
 
-  private fun applyStreamingOptions() {
+    if (networkPreferences.demuxerThread.get()) {
+      MPVLib.setOptionString("demuxer-thread", "yes")
+    }
+
     val timeout = networkPreferences.networkTimeoutSecs.get().coerceIn(5, 300)
     MPVLib.setOptionString("network-timeout", timeout.toString())
-    val streamBufferKb = networkPreferences.streamBufferSizeKb.get().coerceIn(16, 2048)
-    MPVLib.setOptionString("stream-buffer-size", (streamBufferKb * 1024).toString())
-    if (networkPreferences.preferHighestBandwidth.get()) {
-      MPVLib.setOptionString("hls-bitrate", "max")
-    }
-    if (networkPreferences.optimizeForNetwork.get()) {
-      MPVLib.setOptionString("force-seekable", "yes")
-      MPVLib.setOptionString("hr-seek", "yes")
-      MPVLib.setOptionString(
-        "stream-lavf-o",
-        listOf(
-          "reconnect=1",
-          "reconnect_streamed=1",
-          "reconnect_on_network_error=1",
-          "reconnect_on_http_error=4xx,5xx",
-          "reconnect_delay_max=5",
-          "rw_timeout=${timeout * 1_000_000L}",
-        ).joinToString(","),
-      )
-    }
   }
 
   override fun observeProperties() {
