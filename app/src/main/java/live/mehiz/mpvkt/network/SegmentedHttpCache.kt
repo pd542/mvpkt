@@ -111,7 +111,7 @@ class SegmentedHttpCache(
     session = sess
     Log.i(
       TAG,
-      "segmented ready head=${headBytes} total=${probe.contentLength} " +
+      "segmented ready head=$headBytes total=${probe.contentLength} " +
         "workers=$connCount chunk=$chunk → ${sess.localUrl}",
     )
     return sess.localUrl
