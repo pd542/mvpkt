@@ -28,6 +28,7 @@ import me.zhanghai.compose.preference.ProvidePreferenceLocals
 import me.zhanghai.compose.preference.SliderPreference
 import me.zhanghai.compose.preference.SwitchPreference
 import org.koin.compose.koinInject
+import kotlin.math.roundToInt
 
 @Serializable
 object NetworkPreferencesScreen : Screen {
@@ -60,42 +61,50 @@ object NetworkPreferencesScreen : Screen {
           )
 
           val demuxerMaxCacheMb by preferences.demuxerMaxCacheMb.collectAsState()
+          val demuxerMaxCacheMbFloat = demuxerMaxCacheMb.toFloat()
           SliderPreference(
-            value = demuxerMaxCacheMb.toFloat(),
-            onValueChange = { preferences.demuxerMaxCacheMb.set(it.toInt().coerceIn(8, 512)) },
+            value = demuxerMaxCacheMbFloat,
+            onValueChange = { value ->
+              preferences.demuxerMaxCacheMb.set(value.roundToInt().coerceIn(8, 512))
+            },
             title = { Text(stringResource(R.string.pref_network_demuxer_max_cache)) },
+            valueRange = 8f..512f,
             summary = {
               Text(stringResource(R.string.pref_network_value_mb, demuxerMaxCacheMb))
             },
-            valueRange = 8f..512f,
-            steps = 62,
-            sliderValue = demuxerMaxCacheMb.toFloat(),
-            onSliderValueChange = {
-              preferences.demuxerMaxCacheMb.set(it.toInt().coerceIn(8, 512))
+            onSliderValueChange = { value ->
+              preferences.demuxerMaxCacheMb.set(value.roundToInt().coerceIn(8, 512))
             },
+            sliderValue = demuxerMaxCacheMbFloat,
           )
 
           val demuxerMaxBackCacheMb by preferences.demuxerMaxBackCacheMb.collectAsState()
+          val demuxerMaxBackCacheMbFloat = demuxerMaxBackCacheMb.toFloat()
           SliderPreference(
-            value = demuxerMaxBackCacheMb.toFloat(),
-            onValueChange = { preferences.demuxerMaxBackCacheMb.set(it.toInt().coerceIn(8, 512)) },
+            value = demuxerMaxBackCacheMbFloat,
+            onValueChange = { value ->
+              preferences.demuxerMaxBackCacheMb.set(value.roundToInt().coerceIn(8, 512))
+            },
             title = { Text(stringResource(R.string.pref_network_demuxer_max_back_cache)) },
+            valueRange = 8f..512f,
             summary = {
               Text(stringResource(R.string.pref_network_value_mb, demuxerMaxBackCacheMb))
             },
-            valueRange = 8f..512f,
-            steps = 62,
-            sliderValue = demuxerMaxBackCacheMb.toFloat(),
-            onSliderValueChange = {
-              preferences.demuxerMaxBackCacheMb.set(it.toInt().coerceIn(8, 512))
+            onSliderValueChange = { value ->
+              preferences.demuxerMaxBackCacheMb.set(value.roundToInt().coerceIn(8, 512))
             },
+            sliderValue = demuxerMaxBackCacheMbFloat,
           )
 
           val demuxerReadaheadSecs by preferences.demuxerReadaheadSecs.collectAsState()
+          val demuxerReadaheadSecsFloat = demuxerReadaheadSecs.toFloat()
           SliderPreference(
-            value = demuxerReadaheadSecs.toFloat(),
-            onValueChange = { preferences.demuxerReadaheadSecs.set(it.toInt().coerceIn(0, 120)) },
+            value = demuxerReadaheadSecsFloat,
+            onValueChange = { value ->
+              preferences.demuxerReadaheadSecs.set(value.roundToInt().coerceIn(0, 120))
+            },
             title = { Text(stringResource(R.string.pref_network_demuxer_readahead_secs)) },
+            valueRange = 0f..120f,
             summary = {
               Text(
                 if (demuxerReadaheadSecs == 0) {
@@ -105,28 +114,28 @@ object NetworkPreferencesScreen : Screen {
                 },
               )
             },
-            valueRange = 0f..120f,
-            steps = 119,
-            sliderValue = demuxerReadaheadSecs.toFloat(),
-            onSliderValueChange = {
-              preferences.demuxerReadaheadSecs.set(it.toInt().coerceIn(0, 120))
+            onSliderValueChange = { value ->
+              preferences.demuxerReadaheadSecs.set(value.roundToInt().coerceIn(0, 120))
             },
+            sliderValue = demuxerReadaheadSecsFloat,
           )
 
           val cacheSecs by preferences.cacheSecs.collectAsState()
+          val cacheSecsFloat = cacheSecs.toFloat()
           SliderPreference(
-            value = cacheSecs.toFloat(),
-            onValueChange = { preferences.cacheSecs.set(it.toInt().coerceIn(1, 300)) },
+            value = cacheSecsFloat,
+            onValueChange = { value ->
+              preferences.cacheSecs.set(value.roundToInt().coerceIn(1, 300))
+            },
             title = { Text(stringResource(R.string.pref_network_cache_secs)) },
+            valueRange = 1f..300f,
             summary = {
               Text(stringResource(R.string.pref_network_value_secs, cacheSecs))
             },
-            valueRange = 1f..300f,
-            steps = 298,
-            sliderValue = cacheSecs.toFloat(),
-            onSliderValueChange = {
-              preferences.cacheSecs.set(it.toInt().coerceIn(1, 300))
+            onSliderValueChange = { value ->
+              preferences.cacheSecs.set(value.roundToInt().coerceIn(1, 300))
             },
+            sliderValue = cacheSecsFloat,
           )
 
           val cachePauseInitial by preferences.cachePauseInitial.collectAsState()
@@ -138,19 +147,21 @@ object NetworkPreferencesScreen : Screen {
           )
 
           val cachePauseWaitSecs by preferences.cachePauseWaitSecs.collectAsState()
+          val cachePauseWaitSecsFloat = cachePauseWaitSecs.toFloat()
           SliderPreference(
-            value = cachePauseWaitSecs.toFloat(),
-            onValueChange = { preferences.cachePauseWaitSecs.set(it.toInt().coerceIn(0, 30)) },
+            value = cachePauseWaitSecsFloat,
+            onValueChange = { value ->
+              preferences.cachePauseWaitSecs.set(value.roundToInt().coerceIn(0, 30))
+            },
             title = { Text(stringResource(R.string.pref_network_cache_pause_wait)) },
+            valueRange = 0f..30f,
             summary = {
               Text(stringResource(R.string.pref_network_value_secs, cachePauseWaitSecs))
             },
-            valueRange = 0f..30f,
-            steps = 29,
-            sliderValue = cachePauseWaitSecs.toFloat(),
-            onSliderValueChange = {
-              preferences.cachePauseWaitSecs.set(it.toInt().coerceIn(0, 30))
+            onSliderValueChange = { value ->
+              preferences.cachePauseWaitSecs.set(value.roundToInt().coerceIn(0, 30))
             },
+            sliderValue = cachePauseWaitSecsFloat,
           )
 
           PreferenceCategory(
@@ -158,10 +169,14 @@ object NetworkPreferencesScreen : Screen {
           )
 
           val videoDecoderThreads by preferences.videoDecoderThreads.collectAsState()
+          val videoDecoderThreadsFloat = videoDecoderThreads.toFloat()
           SliderPreference(
-            value = videoDecoderThreads.toFloat(),
-            onValueChange = { preferences.videoDecoderThreads.set(it.toInt().coerceIn(0, 16)) },
+            value = videoDecoderThreadsFloat,
+            onValueChange = { value ->
+              preferences.videoDecoderThreads.set(value.roundToInt().coerceIn(0, 16))
+            },
             title = { Text(stringResource(R.string.pref_network_video_decoder_threads)) },
+            valueRange = 0f..16f,
             summary = {
               Text(
                 if (videoDecoderThreads == 0) {
@@ -171,19 +186,21 @@ object NetworkPreferencesScreen : Screen {
                 },
               )
             },
-            valueRange = 0f..16f,
-            steps = 15,
-            sliderValue = videoDecoderThreads.toFloat(),
-            onSliderValueChange = {
-              preferences.videoDecoderThreads.set(it.toInt().coerceIn(0, 16))
+            onSliderValueChange = { value ->
+              preferences.videoDecoderThreads.set(value.roundToInt().coerceIn(0, 16))
             },
+            sliderValue = videoDecoderThreadsFloat,
           )
 
           val audioDecoderThreads by preferences.audioDecoderThreads.collectAsState()
+          val audioDecoderThreadsFloat = audioDecoderThreads.toFloat()
           SliderPreference(
-            value = audioDecoderThreads.toFloat(),
-            onValueChange = { preferences.audioDecoderThreads.set(it.toInt().coerceIn(0, 8)) },
+            value = audioDecoderThreadsFloat,
+            onValueChange = { value ->
+              preferences.audioDecoderThreads.set(value.roundToInt().coerceIn(0, 8))
+            },
             title = { Text(stringResource(R.string.pref_network_audio_decoder_threads)) },
+            valueRange = 0f..8f,
             summary = {
               Text(
                 if (audioDecoderThreads == 0) {
@@ -193,12 +210,10 @@ object NetworkPreferencesScreen : Screen {
                 },
               )
             },
-            valueRange = 0f..8f,
-            steps = 7,
-            sliderValue = audioDecoderThreads.toFloat(),
-            onSliderValueChange = {
-              preferences.audioDecoderThreads.set(it.toInt().coerceIn(0, 8))
+            onSliderValueChange = { value ->
+              preferences.audioDecoderThreads.set(value.roundToInt().coerceIn(0, 8))
             },
+            sliderValue = audioDecoderThreadsFloat,
           )
 
           val demuxerThread by preferences.demuxerThread.collectAsState()
@@ -230,37 +245,39 @@ object NetworkPreferencesScreen : Screen {
           )
 
           val networkTimeoutSecs by preferences.networkTimeoutSecs.collectAsState()
+          val networkTimeoutSecsFloat = networkTimeoutSecs.toFloat()
           SliderPreference(
-            value = networkTimeoutSecs.toFloat(),
-            onValueChange = { preferences.networkTimeoutSecs.set(it.toInt().coerceIn(5, 300)) },
+            value = networkTimeoutSecsFloat,
+            onValueChange = { value ->
+              preferences.networkTimeoutSecs.set(value.roundToInt().coerceIn(5, 300))
+            },
             title = { Text(stringResource(R.string.pref_network_timeout)) },
+            valueRange = 5f..300f,
             summary = {
               Text(stringResource(R.string.pref_network_value_secs, networkTimeoutSecs))
             },
-            valueRange = 5f..300f,
-            steps = 58,
-            sliderValue = networkTimeoutSecs.toFloat(),
-            onSliderValueChange = {
-              preferences.networkTimeoutSecs.set(it.toInt().coerceIn(5, 300))
+            onSliderValueChange = { value ->
+              preferences.networkTimeoutSecs.set(value.roundToInt().coerceIn(5, 300))
             },
+            sliderValue = networkTimeoutSecsFloat,
           )
 
           val streamBufferSizeKb by preferences.streamBufferSizeKb.collectAsState()
+          val streamBufferSizeKbFloat = streamBufferSizeKb.toFloat()
           SliderPreference(
-            value = streamBufferSizeKb.toFloat(),
-            onValueChange = {
-              preferences.streamBufferSizeKb.set(it.toInt().coerceIn(16, 2048))
+            value = streamBufferSizeKbFloat,
+            onValueChange = { value ->
+              preferences.streamBufferSizeKb.set(value.roundToInt().coerceIn(16, 2048))
             },
             title = { Text(stringResource(R.string.pref_network_stream_buffer_size)) },
+            valueRange = 16f..2048f,
             summary = {
               Text(stringResource(R.string.pref_network_value_kb, streamBufferSizeKb))
             },
-            valueRange = 16f..2048f,
-            steps = 126,
-            sliderValue = streamBufferSizeKb.toFloat(),
-            onSliderValueChange = {
-              preferences.streamBufferSizeKb.set(it.toInt().coerceIn(16, 2048))
+            onSliderValueChange = { value ->
+              preferences.streamBufferSizeKb.set(value.roundToInt().coerceIn(16, 2048))
             },
+            sliderValue = streamBufferSizeKbFloat,
           )
 
           val tlsVerify by preferences.tlsVerify.collectAsState()
