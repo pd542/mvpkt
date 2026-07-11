@@ -87,6 +87,7 @@ class PlayerActivity : AppCompatActivity() {
   private var fileName = ""
   private var mediaPlaybackService: MediaPlaybackService? = null
   private var serviceBound = false
+
   /** Multi-connection Range downloader + local proxy (progressive HTTP only). */
   private var segmentedHttpCache: SegmentedHttpCache? = null
 
@@ -167,8 +168,11 @@ class PlayerActivity : AppCompatActivity() {
    * return `http://127.0.0.1:port/...` for mpv. Otherwise return [uri] unchanged.
    */
   private fun maybeAccelerateHttp(uri: String): String {
-    if (!networkPreferences.multiConnectionDownload.get()) return uri
-    if (!SegmentedHttpCache.isAcceleratableUrl(uri)) return uri
+    val enabled = networkPreferences.multiConnectionDownload.get() &&
+      SegmentedHttpCache.isAcceleratableUrl(uri)
+    if (!enabled) {
+      return uri
+    }
 
     // Replace any previous session when loading a new file.
     segmentedHttpCache?.close()
@@ -185,7 +189,7 @@ class PlayerActivity : AppCompatActivity() {
     val local = accelerator.open(uri)
     if (local != uri) {
       segmentedHttpCache = accelerator
-      Log.i(TAG, "Multi-connection accelerate: $uri → $local ($connections conn, ${chunkKb}KiB chunks)")
+      Log.i(TAG, "Multi-connection accelerate: $uri → $local ($connections conn, ${chunkKb}KiB)")
     } else {
       accelerator.close()
       Log.i(TAG, "Multi-connection not used for: $uri")

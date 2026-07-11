@@ -1,3 +1,13 @@
+@file:Suppress(
+  "ReturnCount",
+  "LongParameterList",
+  "CyclomaticComplexMethod",
+  "NestedBlockDepth",
+  "LoopWithTooManyJumpStatements",
+  "LongMethod",
+  "TooManyFunctions",
+)
+
 package live.mehiz.mpvkt.network
 
 import android.util.Log
@@ -51,40 +61,45 @@ class SegmentedHttpCache(
    * @return local proxy URL if acceleration started, otherwise [originalUrl]
    */
   fun open(originalUrl: String): String {
-    if (!isAcceleratableUrl(originalUrl)) return originalUrl
-    return try {
-      val probe = probe(originalUrl)
-      if (!probe.supportsRange || probe.contentLength <= 0L) {
-        Log.i(TAG, "Range unsupported or unknown length → pass-through")
-        return originalUrl
-      }
-      // Small files: multi-conn overhead not worth it
-      if (probe.contentLength < chunkBytes.toLong()) {
-        return originalUrl
-      }
-      val sess = Session(
-        originUrl = probe.finalUrl,
-        totalSize = probe.contentLength,
-        contentType = probe.contentType ?: "application/octet-stream",
-        connections = connections.coerceIn(2, 16),
-        chunkBytes = chunkBytes.coerceIn(256 * 1024, 8 * 1024 * 1024),
-        cacheDir = cacheDir,
-        userAgent = userAgent,
-      )
-      sess.start()
-      session = sess
-      // Wait briefly for the first chunk so mpv does not hit empty stream immediately.
-      sess.store.waitContiguous(0L, min(probe.contentLength, 256 * 1024L), 15_000L)
-      sess.localUrl
-    } catch (e: Exception) {
-      Log.e(TAG, "Failed to start segmented cache: ${e.message}", e)
+    if (!isAcceleratableUrl(originalUrl)) {
+      return originalUrl
+    }
+    return runCatching { startSession(originalUrl) }.getOrElse { error ->
+      Log.e(TAG, "Failed to start segmented cache: ${error.message}", error)
       close()
       originalUrl
     }
   }
 
+  private fun startSession(originalUrl: String): String {
+    val probe = probe(originalUrl)
+    val tooSmall = probe.contentLength in 1 until chunkBytes.toLong()
+    if (!probe.supportsRange || probe.contentLength <= 0L || tooSmall) {
+      Log.i(TAG, "Range unsupported / unknown / small → pass-through")
+      return originalUrl
+    }
+    val sess = Session(
+      config = SessionConfig(
+        originUrl = probe.finalUrl,
+        totalSize = probe.contentLength,
+        contentType = probe.contentType ?: "application/octet-stream",
+        connections = connections.coerceIn(2, 16),
+        chunkBytes = chunkBytes.coerceIn(MIN_CHUNK, MAX_CHUNK),
+        userAgent = userAgent,
+      ),
+      cacheDir = cacheDir,
+    )
+    sess.start()
+    session = sess
+    // Wait briefly for the first chunk so mpv does not hit an empty stream.
+    sess.store.waitContiguous(0L, min(probe.contentLength, FIRST_WAIT_BYTES), FIRST_WAIT_MS)
+    return sess.localUrl
+  }
+
   fun close() {
-    if (!closed.compareAndSet(false, true)) return
+    if (!closed.compareAndSet(false, true)) {
+      return
+    }
     session?.close()
     session = null
   }
@@ -93,43 +108,54 @@ class SegmentedHttpCache(
     private const val TAG = "SegmentedHttpCache"
     private const val DEFAULT_UA =
       "mpvKt-segmented/1.0 (Linux; Android) AppleWebKit/537.36 Chrome/120.0.0.0"
+    private const val MIN_CHUNK = 256 * 1024
+    private const val MAX_CHUNK = 8 * 1024 * 1024
+    private const val FIRST_WAIT_BYTES = 256 * 1024L
+    private const val FIRST_WAIT_MS = 15_000L
 
     fun isAcceleratableUrl(url: String): Boolean {
       val lower = url.lowercase(Locale.US)
-      if (!lower.startsWith("http://") && !lower.startsWith("https://")) return false
-      // Adaptive streaming — not handled by byte-range multi-conn
-      if (lower.contains(".m3u8") || lower.contains(".mpd") || lower.contains("format=m3u")) return false
-      return true
+      val isHttp = lower.startsWith("http://") || lower.startsWith("https://")
+      val isAdaptive = lower.contains(".m3u8") ||
+        lower.contains(".mpd") ||
+        lower.contains("format=m3u")
+      return isHttp && !isAdaptive
     }
 
     fun probe(url: String, userAgent: String = DEFAULT_UA): ProbeResult {
-      var current = url
-      // Prefer HEAD; some CDNs block HEAD → fall back to Range GET 0-0
-      val head = openConnection(current, userAgent).apply {
+      val headResult = runCatching { probeWithHead(url, userAgent) }.getOrNull()
+      if (headResult != null) {
+        return headResult
+      }
+      return confirmRange(url, -1L, null, userAgent)
+    }
+
+    private fun probeWithHead(url: String, userAgent: String): ProbeResult? {
+      val head = openConnection(url, userAgent).apply {
         requestMethod = "HEAD"
         instanceFollowRedirects = true
         connectTimeout = 12_000
         readTimeout = 12_000
       }
-      try {
+      return try {
         head.connect()
         val code = head.responseCode
-        current = head.url.toString()
+        val current = head.url.toString()
         val len = head.getHeaderFieldLong("Content-Length", -1L)
         val accept = head.getHeaderField("Accept-Ranges")?.lowercase(Locale.US)
         val type = head.contentType
         head.disconnect()
-        if (code in 200..299 && len > 0) {
-          // Accept-Ranges: none → no; missing/bytes → confirm with GET range
-          if (accept?.contains("none") == true) {
-            return ProbeResult(false, len, type, current)
-          }
-          return confirmRange(current, len, type, userAgent)
+        if (code !in 200..299 || len <= 0) {
+          null
+        } else if (accept?.contains("none") == true) {
+          ProbeResult(false, len, type, current)
+        } else {
+          confirmRange(current, len, type, userAgent)
         }
       } catch (_: Exception) {
         runCatching { head.disconnect() }
+        null
       }
-      return confirmRange(url, -1L, null, userAgent)
     }
 
     private fun confirmRange(
@@ -151,7 +177,7 @@ class SegmentedHttpCache(
         val finalUrl = conn.url.toString()
         val type = conn.contentType ?: knownType
         if (code == HttpURLConnection.HTTP_PARTIAL) {
-          val cr = conn.getHeaderField("Content-Range") // bytes 0-0/12345
+          val cr = conn.getHeaderField("Content-Range")
           val total = parseTotalFromContentRange(cr) ?: knownLen
           conn.inputStream?.close()
           conn.disconnect()
@@ -161,20 +187,22 @@ class SegmentedHttpCache(
           conn.disconnect()
           ProbeResult(false, len, type, finalUrl)
         }
-      } catch (e: Exception) {
+      } catch (_: Exception) {
         runCatching { conn.disconnect() }
         ProbeResult(false, knownLen, knownType, url)
       }
     }
 
     private fun parseTotalFromContentRange(header: String?): Long? {
-      if (header.isNullOrBlank()) return null
-      // bytes 0-0/12345 or bytes 0-0/*
+      if (header.isNullOrBlank()) {
+        return null
+      }
       val slash = header.lastIndexOf('/')
-      if (slash < 0 || slash == header.lastIndex) return null
+      if (slash < 0 || slash == header.lastIndex) {
+        return null
+      }
       val total = header.substring(slash + 1).trim()
-      if (total == "*") return null
-      return total.toLongOrNull()
+      return total.takeUnless { it == "*" }?.toLongOrNull()
     }
 
     private fun openConnection(url: String, userAgent: String): HttpURLConnection {
@@ -186,21 +214,24 @@ class SegmentedHttpCache(
     }
   }
 
-  // ── Session ─────────────────────────────────────────────────────────────
-
-  private class Session(
+  private data class SessionConfig(
     val originUrl: String,
     val totalSize: Long,
     val contentType: String,
     val connections: Int,
     val chunkBytes: Int,
-    cacheDir: File,
     val userAgent: String,
+  )
+
+  private class Session(
+    private val config: SessionConfig,
+    cacheDir: File,
   ) {
-    val store = ContiguousStore(totalSize)
-    private val file: File = File(cacheDir, "seg_${originUrl.hashCode().toUInt()}_$totalSize.bin")
+    val store = ContiguousStore(config.totalSize)
+    private val file: File =
+      File(cacheDir, "seg_${config.originUrl.hashCode().toUInt()}_${config.totalSize}.bin")
     private val raf: RandomAccessFile
-    private val executor = Executors.newFixedThreadPool(connections)
+    private val executor = Executors.newFixedThreadPool(config.connections)
     private val serverExecutor = Executors.newCachedThreadPool()
     private val futures = mutableListOf<Future<*>>()
     private val running = AtomicBoolean(true)
@@ -211,27 +242,38 @@ class SegmentedHttpCache(
     init {
       cacheDir.mkdirs()
       raf = RandomAccessFile(file, "rw")
-      raf.setLength(totalSize)
+      raf.setLength(config.totalSize)
       val ss = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
       serverSocket = ss
       localUrl = "http://127.0.0.1:${ss.localPort}/media"
     }
 
     fun start() {
-      // Accept loop
-      serverExecutor.execute {
-        val ss = serverSocket ?: return@execute
-        while (running.get()) {
-          try {
-            val socket = ss.accept()
-            serverExecutor.execute { handleClient(socket) }
-          } catch (_: Exception) {
-            if (!running.get()) break
-          }
+      serverExecutor.execute { acceptLoop() }
+      val chunks = buildChunks(config.totalSize, config.chunkBytes)
+      chunks.forEach { range ->
+        futures += executor.submit { downloadRange(range.first, range.last) }
+      }
+      Log.i(
+        TAG,
+        "Started ${config.connections} workers, ${chunks.size} chunks, " +
+          "size=${config.totalSize} url=${config.originUrl}",
+      )
+    }
+
+    private fun acceptLoop() {
+      val ss = serverSocket ?: return
+      while (running.get()) {
+        try {
+          val socket = ss.accept()
+          serverExecutor.execute { handleClient(socket) }
+        } catch (_: Exception) {
+          if (!running.get()) break
         }
       }
+    }
 
-      // Build chunk list; prioritize start of file for playback.
+    private fun buildChunks(totalSize: Long, chunkBytes: Int): List<LongRange> {
       val chunks = ArrayList<LongRange>()
       var pos = 0L
       while (pos < totalSize) {
@@ -239,62 +281,63 @@ class SegmentedHttpCache(
         chunks.add(pos..end)
         pos = end + 1
       }
-      // First 2 chunks sequential workers bias: submit head first then rest
-      chunks.forEach { range ->
-        futures += executor.submit { downloadRange(range.first, range.last) }
-      }
-      Log.i(TAG, "Started $connections workers, ${chunks.size} chunks, size=$totalSize url=$originUrl")
+      return chunks
     }
 
     private fun downloadRange(start: Long, endInclusive: Long) {
-      if (!running.get()) return
-      // Skip if already complete
-      if (store.isFullyCovered(start, endInclusive + 1)) return
-      var attempt = 0
-      while (attempt < 3 && running.get()) {
-        attempt++
-        var conn: HttpURLConnection? = null
-        try {
-          conn = openConnection(originUrl, userAgent).apply {
-            requestMethod = "GET"
-            setRequestProperty("Range", "bytes=$start-$endInclusive")
-            instanceFollowRedirects = true
-            connectTimeout = 15_000
-            readTimeout = 30_000
-          }
-          conn.connect()
-          val code = conn.responseCode
-          if (code != HttpURLConnection.HTTP_PARTIAL && code != HttpURLConnection.HTTP_OK) {
-            throw IOException("HTTP $code for range $start-$endInclusive")
-          }
-          val input = BufferedInputStream(conn.inputStream)
-          val buf = ByteArray(64 * 1024)
-          var writePos = start
-          while (running.get()) {
-            val n = input.read(buf)
-            if (n < 0) break
-            synchronized(raf) {
-              raf.seek(writePos)
-              raf.write(buf, 0, n)
-            }
-            writePos += n
-            downloaded.addAndGet(n.toLong())
-            store.mark(writePos - n, writePos)
-            if (writePos > endInclusive) break
-          }
-          input.close()
-          conn.disconnect()
-          return
-        } catch (e: Exception) {
-          Log.w(TAG, "chunk $start-$endInclusive attempt $attempt failed: ${e.message}")
-          runCatching { conn?.disconnect() }
-          try {
-            Thread.sleep(300L * attempt)
-          } catch (_: InterruptedException) {
-            return
-          }
-        }
+      if (!running.get() || store.isFullyCovered(start, endInclusive + 1)) {
+        return
       }
+      repeat(3) { attempt ->
+        if (!running.get()) return
+        if (tryDownloadOnce(start, endInclusive)) return
+        Log.w(TAG, "chunk $start-$endInclusive attempt ${attempt + 1} failed")
+        runCatching { Thread.sleep(300L * (attempt + 1)) }
+      }
+    }
+
+    private fun tryDownloadOnce(start: Long, endInclusive: Long): Boolean {
+      var conn: HttpURLConnection? = null
+      return try {
+        conn = openConnection(config.originUrl, config.userAgent).apply {
+          requestMethod = "GET"
+          setRequestProperty("Range", "bytes=$start-$endInclusive")
+          instanceFollowRedirects = true
+          connectTimeout = 15_000
+          readTimeout = 30_000
+        }
+        conn.connect()
+        val code = conn.responseCode
+        if (code != HttpURLConnection.HTTP_PARTIAL && code != HttpURLConnection.HTTP_OK) {
+          throw IOException("HTTP $code for range $start-$endInclusive")
+        }
+        writeStreamToFile(conn.inputStream, start, endInclusive)
+        true
+      } catch (_: Exception) {
+        false
+      } finally {
+        runCatching { conn?.disconnect() }
+      }
+    }
+
+    private fun writeStreamToFile(stream: InputStream, start: Long, endInclusive: Long) {
+      val input = BufferedInputStream(stream)
+      val buf = ByteArray(64 * 1024)
+      var writePos = start
+      while (running.get()) {
+        val n = input.read(buf)
+        if (n < 0) break
+        synchronized(raf) {
+          raf.seek(writePos)
+          raf.write(buf, 0, n)
+        }
+        val from = writePos
+        writePos += n
+        downloaded.addAndGet(n.toLong())
+        store.mark(from, writePos)
+        if (writePos > endInclusive) break
+      }
+      input.close()
     }
 
     private fun handleClient(socket: Socket) {
@@ -302,59 +345,57 @@ class SegmentedHttpCache(
         socket.soTimeout = 0
         val input = BufferedInputStream(socket.getInputStream())
         val output = BufferedOutputStream(socket.getOutputStream())
-        val request = readHttpRequest(input) ?: run {
+        val request = readHttpRequest(input)
+        if (request == null) {
           socket.close()
           return
         }
-        if (request.method != "GET" && request.method != "HEAD") {
-          writeResponse(output, 405, "Method Not Allowed", contentType, 0, emptyMap(), null)
-          output.flush()
-          socket.close()
-          return
-        }
-        val range = parseRangeHeader(request.headers["range"], totalSize)
-        if (range != null) {
-          val (from, to) = range
-          val length = to - from + 1
-          // Wait until this range is available (or timeout → 503)
-          val ready = store.waitContiguous(from, length, 60_000L)
-          if (!ready && !store.hasAny()) {
-            writeResponse(output, 503, "Service Unavailable", contentType, 0, emptyMap(), null)
-            output.flush()
-            socket.close()
-            return
-          }
-          val headers = mapOf(
-            "Accept-Ranges" to "bytes",
-            "Content-Range" to "bytes $from-$to/$totalSize",
-          )
-          writeResponse(
-            output,
-            206,
-            "Partial Content",
-            contentType,
-            length,
-            headers,
-            if (request.method == "HEAD") null else BodyReader(from, length),
-          )
-        } else {
-          val headers = mapOf("Accept-Ranges" to "bytes")
-          writeResponse(
-            output,
-            200,
-            "OK",
-            contentType,
-            totalSize,
-            headers,
-            if (request.method == "HEAD") null else BodyReader(0L, totalSize),
-          )
-        }
+        serveRequest(request, output)
         output.flush()
       } catch (e: Exception) {
         Log.d(TAG, "client error: ${e.message}")
       } finally {
         runCatching { socket.close() }
       }
+    }
+
+    private fun serveRequest(request: HttpRequest, output: OutputStream) {
+      if (request.method != "GET" && request.method != "HEAD") {
+        writeResponse(output, ResponseSpec(405, "Method Not Allowed", config.contentType, 0), null)
+        return
+      }
+      val range = parseRangeHeader(request.headers["range"], config.totalSize)
+      val isHead = request.method == "HEAD"
+      if (range != null) {
+        servePartial(range.first, range.second, isHead, output)
+      } else {
+        serveFull(isHead, output)
+      }
+    }
+
+    private fun servePartial(from: Long, to: Long, isHead: Boolean, output: OutputStream) {
+      val length = to - from + 1
+      store.waitContiguous(from, length, 60_000L)
+      val headers = mapOf(
+        "Accept-Ranges" to "bytes",
+        "Content-Range" to "bytes $from-$to/${config.totalSize}",
+      )
+      val body = if (isHead) null else BodyReader(from, length)
+      writeResponse(
+        output,
+        ResponseSpec(206, "Partial Content", config.contentType, length, headers),
+        body,
+      )
+    }
+
+    private fun serveFull(isHead: Boolean, output: OutputStream) {
+      val headers = mapOf("Accept-Ranges" to "bytes")
+      val body = if (isHead) null else BodyReader(0L, config.totalSize)
+      writeResponse(
+        output,
+        ResponseSpec(200, "OK", config.contentType, config.totalSize, headers),
+        body,
+      )
     }
 
     private inner class BodyReader(private val start: Long, private val length: Long) {
@@ -364,28 +405,20 @@ class SegmentedHttpCache(
         var pos = start
         while (remaining > 0 && running.get()) {
           val want = min(buf.size.toLong(), remaining).toInt()
-          // Ensure contiguous data present
-          if (!store.waitContiguous(pos, want.toLong(), 30_000L)) {
-            // write what we can
-            val avail = store.contiguousFrom(pos).toInt().coerceAtLeast(0)
-            if (avail <= 0) break
-            val n = min(avail, want)
-            synchronized(raf) {
-              raf.seek(pos)
-              raf.readFully(buf, 0, n)
-            }
-            out.write(buf, 0, n)
-            pos += n
-            remaining -= n
-            continue
+          val ready = store.waitContiguous(pos, want.toLong(), 30_000L)
+          val toRead = if (ready) {
+            want
+          } else {
+            store.contiguousFrom(pos).toInt().coerceAtLeast(0).coerceAtMost(want)
           }
+          if (toRead <= 0) break
           synchronized(raf) {
             raf.seek(pos)
-            raf.readFully(buf, 0, want)
+            raf.readFully(buf, 0, toRead)
           }
-          out.write(buf, 0, want)
-          pos += want
-          remaining -= want
+          out.write(buf, 0, toRead)
+          pos += toRead
+          remaining -= toRead
         }
       }
     }
@@ -397,14 +430,21 @@ class SegmentedHttpCache(
       serverExecutor.shutdownNow()
       runCatching { serverSocket?.close() }
       runCatching { raf.close() }
-      // keep cache file for possible reuse; delete if incomplete optional
-      Log.i(TAG, "Session closed, downloaded=${downloaded.get()}/$totalSize")
+      Log.i(TAG, "Session closed, downloaded=${downloaded.get()}/${config.totalSize}")
     }
 
     private data class HttpRequest(
       val method: String,
       val path: String,
       val headers: Map<String, String>,
+    )
+
+    private data class ResponseSpec(
+      val code: Int,
+      val reason: String,
+      val type: String,
+      val contentLength: Long,
+      val extra: Map<String, String> = emptyMap(),
     )
 
     private fun readHttpRequest(input: InputStream): HttpRequest? {
@@ -417,9 +457,8 @@ class SegmentedHttpCache(
         if (line.isEmpty()) break
         val idx = line.indexOf(':')
         if (idx > 0) {
-          val key = line.substring(0, idx).trim().lowercase(Locale.US)
-          val value = line.substring(idx + 1).trim()
-          headers[key] = value
+          headers[line.substring(0, idx).trim().lowercase(Locale.US)] =
+            line.substring(idx + 1).trim()
         }
       }
       return HttpRequest(parts[0].uppercase(Locale.US), parts[1], headers)
@@ -429,48 +468,38 @@ class SegmentedHttpCache(
       val sb = StringBuilder()
       while (true) {
         val c = input.read()
-        if (c < 0) return if (sb.isEmpty()) null else sb.toString()
+        if (c < 0) {
+          return sb.toString().ifEmpty { null }
+        }
         if (c == '\n'.code) break
         if (c != '\r'.code) sb.append(c.toChar())
       }
       return sb.toString()
     }
 
-    private fun writeResponse(
-      out: OutputStream,
-      code: Int,
-      reason: String,
-      type: String,
-      contentLength: Long,
-      extra: Map<String, String>,
-      body: BodyReader?,
-    ) {
+    private fun writeResponse(out: OutputStream, spec: ResponseSpec, body: BodyReader?) {
       val sb = StringBuilder()
-      sb.append("HTTP/1.1 ").append(code).append(' ').append(reason).append("\r\n")
-      sb.append("Content-Type: ").append(type).append("\r\n")
-      sb.append("Content-Length: ").append(contentLength).append("\r\n")
+      sb.append("HTTP/1.1 ").append(spec.code).append(' ').append(spec.reason).append("\r\n")
+      sb.append("Content-Type: ").append(spec.type).append("\r\n")
+      sb.append("Content-Length: ").append(spec.contentLength).append("\r\n")
       sb.append("Connection: close\r\n")
-      extra.forEach { (k, v) -> sb.append(k).append(": ").append(v).append("\r\n") }
+      spec.extra.forEach { (k, v) -> sb.append(k).append(": ").append(v).append("\r\n") }
       sb.append("\r\n")
       out.write(sb.toString().toByteArray(Charsets.US_ASCII))
       body?.writeTo(out)
     }
 
-    /** @return pair from-to inclusive, or null for full body */
     private fun parseRangeHeader(header: String?, total: Long): Pair<Long, Long>? {
-      if (header.isNullOrBlank()) return null
-      // bytes=start-end | bytes=start-
-      if (!header.lowercase(Locale.US).startsWith("bytes=")) return null
+      if (header.isNullOrBlank() || !header.lowercase(Locale.US).startsWith("bytes=")) {
+        return null
+      }
       val spec = header.substring(6).trim()
       val dash = spec.indexOf('-')
       if (dash < 0) return null
-      val startStr = spec.substring(0, dash)
+      val start = spec.substring(0, dash).toLongOrNull() ?: return null
       val endStr = spec.substring(dash + 1)
-      if (startStr.isEmpty()) return null // suffix ranges not needed
-      val start = startStr.toLongOrNull() ?: return null
       val end = if (endStr.isEmpty()) total - 1 else endStr.toLongOrNull() ?: return null
-      if (start < 0 || end >= total || start > end) return null
-      return start to end
+      return if (start in 0 until total && end in start until total) start to end else null
     }
 
     private fun openConnection(url: String, userAgent: String): HttpURLConnection {
@@ -482,12 +511,9 @@ class SegmentedHttpCache(
     }
   }
 
-  /**
-   * Tracks completed byte intervals and can wait until a contiguous region is filled.
-   */
+  /** Tracks completed byte intervals and can wait until a contiguous region is filled. */
   class ContiguousStore(private val totalSize: Long) {
     private val lock = Object()
-    // merged half-open intervals [start, end)
     private val map = TreeMap<Long, Long>()
 
     fun mark(start: Long, end: Long) {
@@ -495,14 +521,12 @@ class SegmentedHttpCache(
       synchronized(lock) {
         var s = start
         var e = end
-        // merge with previous
         val prev = map.floorEntry(s)
         if (prev != null && prev.value >= s) {
           s = prev.key
           e = maxOf(e, prev.value)
           map.remove(prev.key)
         }
-        // merge with overlapping next
         while (true) {
           val next = map.ceilingEntry(s) ?: break
           if (next.key > e) break
@@ -514,19 +538,14 @@ class SegmentedHttpCache(
       }
     }
 
-    fun contiguousFrom(pos: Long): Long {
-      synchronized(lock) {
-        val e = map.floorEntry(pos) ?: return 0L
-        if (e.value <= pos) return 0L
-        return e.value - pos
-      }
+    fun contiguousFrom(pos: Long): Long = synchronized(lock) {
+      val entry = map.floorEntry(pos)
+      if (entry == null || entry.value <= pos) 0L else entry.value - pos
     }
 
-    fun isFullyCovered(start: Long, endExclusive: Long): Boolean {
-      synchronized(lock) {
-        val e = map.floorEntry(start) ?: return false
-        return e.value >= endExclusive
-      }
+    fun isFullyCovered(start: Long, endExclusive: Long): Boolean = synchronized(lock) {
+      val entry = map.floorEntry(start)
+      entry != null && entry.value >= endExclusive
     }
 
     fun hasAny(): Boolean = synchronized(lock) { map.isNotEmpty() }

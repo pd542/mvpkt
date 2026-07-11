@@ -93,38 +93,36 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
     setupAudioOptions()
   }
 
-  /**
-   * Applies demuxer cache / readahead (what actually affects buffering) and decoder threads
-   * (CPU decode only — does **not** increase download speed).
-   *
-   * Must be set before loadfile; change settings then re-open the media.
-   */
+  /** Cache capacity / readahead + decoder threads. Must run before loadfile. */
   private fun setupNetworkAndCacheOptions() {
-    // --- Cache capacity & how far ahead to read (these affect buffering, not "threads") ---
-    val forwardCacheBytes = networkPreferences.demuxerMaxCacheMb.get().coerceIn(8, 512) * 1024L * 1024L
-    val backCacheBytes = networkPreferences.demuxerMaxBackCacheMb.get().coerceIn(8, 512) * 1024L * 1024L
+    applyDemuxerCacheOptions()
+    applyDecoderThreadOptions()
+    applyStreamingOptions()
+  }
+
+  private fun applyDemuxerCacheOptions() {
+    val forwardCacheBytes =
+      networkPreferences.demuxerMaxCacheMb.get().coerceIn(8, 512) * 1024L * 1024L
+    val backCacheBytes =
+      networkPreferences.demuxerMaxBackCacheMb.get().coerceIn(8, 512) * 1024L * 1024L
     MPVLib.setOptionString("demuxer-max-bytes", forwardCacheBytes.toString())
     MPVLib.setOptionString("demuxer-max-back-bytes", backCacheBytes.toString())
-
-    val readaheadSecs = networkPreferences.demuxerReadaheadSecs.get().coerceIn(0, 120)
-    MPVLib.setOptionString("demuxer-readahead-secs", readaheadSecs.toString())
-
-    val cacheSecs = networkPreferences.cacheSecs.get().coerceIn(1, 300)
-    MPVLib.setOptionString("cache-secs", cacheSecs.toString())
-    // Always enable stream cache for progressive HTTP / HLS style sources.
+    MPVLib.setOptionString(
+      "demuxer-readahead-secs",
+      networkPreferences.demuxerReadaheadSecs.get().coerceIn(0, 120).toString(),
+    )
+    MPVLib.setOptionString(
+      "cache-secs",
+      networkPreferences.cacheSecs.get().coerceIn(1, 300).toString(),
+    )
     MPVLib.setOptionString("cache", "yes")
     MPVLib.setOptionString("demuxer-donate-buffer", "yes")
     MPVLib.setOptionString(
       "demuxer-seekable-cache",
       if (networkPreferences.demuxerSeekableCache.get()) "yes" else "no",
     )
-    // Wait until readahead target is reasonably filled before considering cache ready.
     MPVLib.setOptionString("demuxer-cache-wait", "no")
-
-    MPVLib.setOptionString(
-      "cache-pause",
-      "yes",
-    )
+    MPVLib.setOptionString("cache-pause", "yes")
     MPVLib.setOptionString(
       "cache-pause-initial",
       if (networkPreferences.cachePauseInitial.get()) "yes" else "no",
@@ -133,8 +131,9 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
       "cache-pause-wait",
       networkPreferences.cachePauseWaitSecs.get().coerceIn(0, 30).toString(),
     )
+  }
 
-    // --- Decoder threads: only help software decode CPU load ---
+  private fun applyDecoderThreadOptions() {
     val vdThreads = networkPreferences.videoDecoderThreads.get().coerceIn(0, 16)
     if (vdThreads > 0) {
       MPVLib.setOptionString("vd-lavc-threads", vdThreads.toString())
@@ -143,7 +142,6 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
     if (adThreads > 0) {
       MPVLib.setOptionString("ad-lavc-threads", adThreads.toString())
     }
-
     MPVLib.setOptionString(
       "demuxer-thread",
       if (networkPreferences.demuxerThread.get()) "yes" else "no",
@@ -152,26 +150,19 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
       "prefetch-playlist",
       if (networkPreferences.prefetchPlaylist.get()) "yes" else "no",
     )
+  }
 
+  private fun applyStreamingOptions() {
     val timeout = networkPreferences.networkTimeoutSecs.get().coerceIn(5, 300)
     MPVLib.setOptionString("network-timeout", timeout.toString())
-
-    // Larger low-level stream buffer reduces syscall overhead on high-bitrate streams.
     val streamBufferKb = networkPreferences.streamBufferSizeKb.get().coerceIn(16, 2048)
     MPVLib.setOptionString("stream-buffer-size", (streamBufferKb * 1024).toString())
-
     if (networkPreferences.preferHighestBandwidth.get()) {
-      // Prefer top rung of adaptive streams when the demuxer supports it.
       MPVLib.setOptionString("hls-bitrate", "max")
     }
-
     if (networkPreferences.optimizeForNetwork.get()) {
-      // Helpful for HTTP progressive / HLS / DASH on mobile networks.
       MPVLib.setOptionString("force-seekable", "yes")
       MPVLib.setOptionString("hr-seek", "yes")
-      // FFmpeg AVIO reconnect flags — keep the connection alive across stalls.
-      // Note: this does NOT open multiple parallel download connections; mpv/ffmpeg
-      // still fills the demuxer cache on a single stream read path.
       MPVLib.setOptionString(
         "stream-lavf-o",
         listOf(
