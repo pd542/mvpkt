@@ -141,34 +141,37 @@ class PlayerActivity : AppCompatActivity() {
   }
 
   private fun startPlayback(intent: Intent, useLoadfileCommand: Boolean) {
-    val multiConn = networkPreferences.multiConnectionDownload.get()
-    if (!multiConn) {
-      // Fast path — identical to original mpvKt behaviour.
-      resolvePlayableUri(intent)?.let { uri ->
-        Log.i(TAG, "Loading media (direct): $uri")
-        if (useLoadfileCommand) {
-          MPVLib.command("loadfile", uri)
-        } else {
-          player.playFile(uri)
-        }
-      }
+    val source = resolvePlayableUri(intent)
+    if (source == null) {
+      Log.e(TAG, "No playable URI in intent")
       return
     }
 
+    val wantSegmented = networkPreferences.multiConnectionDownload.get() &&
+      SegmentedHttpCache.isAcceleratableUrl(source)
+
+    if (!wantSegmented) {
+      // Direct play — same as upstream mpvKt.
+      playUri(source, useLoadfileCommand)
+      return
+    }
+
+    // Segmented path: probe + head download on IO, then hand URL to mpv.
+    // On failure, open() already returns the original URL.
     lifecycleScope.launch {
       val playable = withContext(Dispatchers.IO) {
-        runCatching { resolvePlayableUri(intent)?.let(::maybeAccelerateHttp) }
-          .getOrElse { error ->
-            Log.e(TAG, "accelerate failed: ${error.message}", error)
-            resolvePlayableUri(intent)
-          }
-      } ?: return@launch
-      Log.i(TAG, "Loading media: $playable")
-      if (useLoadfileCommand) {
-        MPVLib.command("loadfile", playable)
-      } else {
-        player.playFile(playable)
+        runCatching { maybeAccelerateHttp(source) }.getOrDefault(source)
       }
+      playUri(playable, useLoadfileCommand)
+    }
+  }
+
+  private fun playUri(uri: String, useLoadfileCommand: Boolean) {
+    Log.i(TAG, "Loading media: $uri")
+    if (useLoadfileCommand) {
+      MPVLib.command("loadfile", uri)
+    } else {
+      player.playFile(uri)
     }
   }
 

@@ -111,8 +111,8 @@
     <string name="pref_network_tip_title">关于缓存速度</string>
     <string name="pref_network_tip_summary">「解码线程数」不会加快下载。对普通 HTTP(S) 整文件（mp4/mkv 等），请开启「多连接分片下载」：用多个 Range 连接并行拉取，类似浏览器/IDM。HLS/m3u8 无法用这种方式加速。改设置后需重新打开视频。</string>
     <string name="pref_network_category_multiconn">多连接分片下载</string>
-    <string name="pref_network_multi_connection">多连接分片下载（Range）</string>
-    <string name="pref_network_multi_connection_summary">可选功能。对支持断点续传的 mp4/mkv 直链，用多连接 Range + 本地代理加速。默认关闭；请先确认普通播放正常再开启。不支持 HLS/m3u8。若开启后无法播放，请关闭此项。</string>
+    <string name="pref_network_multi_connection">分片多连接加载</string>
+    <string name="pref_network_multi_connection_summary">先下载片头保证开播，再用多个 HTTP Range 连接并行填充（类似浏览器/IDM）。适用于支持断点续传的 mp4/mkv 直链；不支持时自动回退直连。不支持 HLS/m3u8。</string>
     <string name="pref_network_multi_connection_count">并行连接数</string>
     <string name="pref_network_multi_connection_chunk">分片大小</string>
     <string name="pref_network_prefer_highest_bandwidth">优先最高 HLS 码率</string>

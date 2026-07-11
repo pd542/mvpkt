@@ -72,16 +72,16 @@ class NetworkPreferences(preferenceStore: PreferenceStore) {
 
   /**
    * Multi-connection Range download (browser/IDM style) for progressive HTTP(S) files.
-   * Serves a local proxy URL to mpv while N connections fill a sparse cache.
+   * Head is downloaded first, then N parallel workers fill the rest via a local proxy.
    * No effect on HLS/DASH (m3u8) or servers without Accept-Ranges.
+   * Auto-falls back to direct URL if Range/head fails.
    */
-  // Default OFF (new key so old installs don't keep a broken "true").
-  // Enable only after normal playback works. Failed accel must not break play.
-  val multiConnectionDownload = preferenceStore.getBoolean("network_multi_connection_download_v2", false)
+  // New key so previous broken defaults are not reused.
+  val multiConnectionDownload = preferenceStore.getBoolean("network_multi_connection_download_v3", true)
 
   /** Parallel connections for multi-connection download (2–16). */
   val multiConnectionCount = preferenceStore.getInt("network_multi_connection_count", 8)
 
-  /** Chunk size per Range request in KiB (256–8192). */
+  /** Chunk size per Range request in KiB (256–4096). */
   val multiConnectionChunkKb = preferenceStore.getInt("network_multi_connection_chunk_kb", 1024)
 }
