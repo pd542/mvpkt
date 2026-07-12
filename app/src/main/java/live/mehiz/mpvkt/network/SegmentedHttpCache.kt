@@ -18,7 +18,6 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.io.RandomAccessFile
@@ -411,44 +410,53 @@ class SegmentedHttpCache(
 
       repeat(retries) { attempt ->
         if (!running.get()) return false
-        var conn: HttpURLConnection? = null
-        try {
-          conn = openConnection(config.originUrl, config.userAgent).apply {
-            requestMethod = "GET"
-            setRequestProperty("Range", "bytes=$start-$end")
-            instanceFollowRedirects = true
-            connectTimeout = CONNECT_TIMEOUT_MS
-            readTimeout = READ_TIMEOUT_MS
+        val err = downloadRangeAttempt(start, end)
+        if (err == null) {
+          if (store.isFullyCovered(start, end + 1)) return true
+          // Partial body is OK if we extended coverage; caller may re-request rest.
+          if (store.contiguousFrom(start) > 0) {
+            log("partial range $start-$end have=${store.contiguousFrom(start)}")
           }
-          conn.connect()
-          val code = conn.responseCode
-          if (code != HttpURLConnection.HTTP_PARTIAL && code != HttpURLConnection.HTTP_OK) {
-            throw IOException("HTTP $code for $start-$end")
-          }
-          if (code == HttpURLConnection.HTTP_OK && start != 0L) {
-            // Server ignored Range — cannot safely write at offset.
-            throw IOException("Range ignored at $start (HTTP 200)")
-          }
-          val wrote = writeStreamToFile(conn.inputStream, start, end)
-          if (store.isFullyCovered(start, end + 1)) {
-            return true
-          }
-          // Require real progress on this hole, not "already had some earlier bytes".
-          if (wrote > 0 && store.contiguousFrom(start) > 0) {
-            // Partial body — accept if we extended coverage; caller may re-request rest.
-            if (store.isFullyCovered(start, end + 1)) return true
-            log("partial range $start-$end wrote=$wrote have=${store.contiguousFrom(start)}")
-          } else {
-            throw IOException("no bytes written for $start-$end")
-          }
-        } catch (e: Exception) {
-          log("range $start-$end try ${attempt + 1}: ${e.message}")
+        } else {
+          log("range $start-$end try ${attempt + 1}: $err")
           runCatching { Thread.sleep(250L * (attempt + 1)) }
-        } finally {
-          runCatching { conn?.disconnect() }
         }
       }
       return store.isFullyCovered(start, end + 1)
+    }
+
+    /** One Range GET attempt. Returns null on success, error message on failure. */
+    private fun downloadRangeAttempt(start: Long, end: Long): String? {
+      var conn: HttpURLConnection? = null
+      return try {
+        conn = openConnection(config.originUrl, config.userAgent).apply {
+          requestMethod = "GET"
+          setRequestProperty("Range", "bytes=$start-$end")
+          instanceFollowRedirects = true
+          connectTimeout = CONNECT_TIMEOUT_MS
+          readTimeout = READ_TIMEOUT_MS
+        }
+        conn.connect()
+        val code = conn.responseCode
+        when {
+          code != HttpURLConnection.HTTP_PARTIAL && code != HttpURLConnection.HTTP_OK ->
+            "HTTP $code for $start-$end"
+          code == HttpURLConnection.HTTP_OK && start != 0L ->
+            "Range ignored at $start (HTTP 200)"
+          else -> {
+            val wrote = writeStreamToFile(conn.inputStream, start, end)
+            if (wrote > 0 || store.isFullyCovered(start, end + 1)) {
+              null
+            } else {
+              "no bytes written for $start-$end"
+            }
+          }
+        }
+      } catch (e: Exception) {
+        e.message ?: e.javaClass.simpleName
+      } finally {
+        runCatching { conn?.disconnect() }
+      }
     }
 
     /** @return number of bytes written */
