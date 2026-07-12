@@ -36,24 +36,37 @@ object LongPauseRecovery {
    * Call immediately before unpausing. Safe no-op for short pauses / local files.
    */
   fun recoverIfNeeded() {
-    val started = pausedAtElapsedMs.get()
-    if (started <= 0L) return
-    val idleMs = SystemClock.elapsedRealtime() - started
-    if (idleMs < LONG_PAUSE_RECOVER_MS) return
-
-    val path = MPVLib.getPropertyString("path").orEmpty()
-    if (!isNetworkLikePath(path)) return
-
-    val pos = MPVLib.getPropertyDouble("time-pos") ?: return
-    Log.i(TAG, "Long-pause recovery after ${idleMs}ms pos=$pos path=$path")
+    val recovery = resolveRecovery() ?: return
+    Log.i(TAG, "Long-pause recovery after ${recovery.idleMs}ms pos=${recovery.pos} path=${recovery.path}")
     runCatching {
       MPVLib.command(
         "seek",
-        String.format(Locale.US, "%.3f", pos.coerceAtLeast(0.0)),
+        String.format(Locale.US, "%.3f", recovery.pos.coerceAtLeast(0.0)),
         "absolute+exact",
       )
     }.onFailure {
       Log.w(TAG, "Long-pause seek recovery failed: ${it.message}")
+    }
+  }
+
+  private data class RecoveryTarget(
+    val idleMs: Long,
+    val pos: Double,
+    val path: String,
+  )
+
+  private fun resolveRecovery(): RecoveryTarget? {
+    val started = pausedAtElapsedMs.get()
+    if (started <= 0L) return null
+    val idleMs = SystemClock.elapsedRealtime() - started
+    if (idleMs < LONG_PAUSE_RECOVER_MS) return null
+
+    val path = MPVLib.getPropertyString("path").orEmpty()
+    val pos = MPVLib.getPropertyDouble("time-pos")
+    return if (isNetworkLikePath(path) && pos != null) {
+      RecoveryTarget(idleMs = idleMs, pos = pos, path = path)
+    } else {
+      null
     }
   }
 

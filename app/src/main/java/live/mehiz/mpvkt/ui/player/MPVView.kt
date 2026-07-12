@@ -101,11 +101,16 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
    * Avoid CDN-hostile flags like reconnect_on_http_error=4xx,5xx.
    */
   private fun setupNetworkAndCacheOptions() {
+    applyDemuxerCacheOptions()
+    applyDecoderThreadOptions()
+    applyStreamingReconnectOptions()
+  }
+
+  private fun applyDemuxerCacheOptions() {
     val forwardCacheBytes =
       networkPreferences.demuxerMaxCacheMb.get().coerceIn(8, 512) * 1024L * 1024L
     val backCacheBytes =
       networkPreferences.demuxerMaxBackCacheMb.get().coerceIn(8, 512) * 1024L * 1024L
-    // Same options upstream always set (with fixed 32/64 MiB).
     MPVLib.setOptionString("demuxer-max-bytes", forwardCacheBytes.toString())
     MPVLib.setOptionString("demuxer-max-back-bytes", backCacheBytes.toString())
 
@@ -130,7 +135,9 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
       "demuxer-seekable-cache",
       if (networkPreferences.demuxerSeekableCache.get()) "yes" else "no",
     )
+  }
 
+  private fun applyDecoderThreadOptions() {
     val vdThreads = networkPreferences.videoDecoderThreads.get().coerceIn(0, 16)
     if (vdThreads > 0) {
       MPVLib.setOptionString("vd-lavc-threads", vdThreads.toString())
@@ -139,14 +146,15 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
     if (adThreads > 0) {
       MPVLib.setOptionString("ad-lavc-threads", adThreads.toString())
     }
-
     if (networkPreferences.demuxerThread.get()) {
       MPVLib.setOptionString("demuxer-thread", "yes")
     }
     if (networkPreferences.prefetchPlaylist.get()) {
       MPVLib.setOptionString("prefetch-playlist", "yes")
     }
+  }
 
+  private fun applyStreamingReconnectOptions() {
     val timeout = networkPreferences.networkTimeoutSecs.get().coerceIn(5, 300)
     MPVLib.setOptionString("network-timeout", timeout.toString())
 
