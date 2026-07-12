@@ -158,23 +158,23 @@ class SegmentedHttpCache(
     private const val CONNECT_TIMEOUT_MS = 15_000
     private const val READ_TIMEOUT_MS = 30_000
 
-    /** Stale seek priority is dropped so failed targets cannot freeze downloads. */
-    private const val PRIORITY_TTL_MS = 8_000L
+    /** Stale seek priority is dropped so a dead target cannot freeze sequential fill forever. */
+    private const val PRIORITY_TTL_MS = 20_000L
 
-    /** Cap blocking ensureRange so proxy responses are not delayed for a full minute. */
-    private const val MAX_ENSURE_TIMEOUT_MS = 8_000L
+    /** Cap a single ensureRange wait (proxy must not freeze mpv for a full minute). */
+    private const val MAX_ENSURE_TIMEOUT_MS = 12_000L
 
     /** Max playhead priority window size (bytes). */
-    private const val MAX_PRIORITY_AHEAD = 2L * 1024L * 1024L
+    private const val MAX_PRIORITY_AHEAD = 4L * 1024L * 1024L
 
-    /** Prefer returning once at least this much is contiguous for streaming. */
-    private const val MIN_STREAM_BYTES = 64L * 1024L
+    /** Prefer asking for at least this many bytes ahead of the read cursor. */
+    private const val MIN_STREAM_BYTES = 256L * 1024L
 
-    /** How long BodyReader waits for the next bytes before aborting the socket. */
-    private const val BODY_READ_TIMEOUT_MS = 12_000L
+    /** Soft cap on empty-read retries before aborting one response body. */
+    private const val BODY_IDLE_ROUNDS_MAX = 80
 
-    /** Soft cap on empty-read retries before aborting the response body. */
-    private const val BODY_IDLE_ROUNDS_MAX = 24
+    /** Move this far (or jump outside window) before treating as a new seek generation. */
+    private const val PRIORITY_SEEK_DELTA = 512L * 1024L
 
     fun isAcceleratableUrl(url: String): Boolean {
       val lower = url.lowercase(Locale.US)
@@ -543,17 +543,32 @@ class SegmentedHttpCache(
     /**
      * Mark [start, endExclusive) as the live playback window.
      * Background sequential fill yields so seek can grab connections.
-     * Each update bumps generation and a short deadline so failed/old seeks
-     * cannot pin the downloader forever (frequent scrub / mid-play stall).
+     *
+     * Important: progressive BodyReader advances [start] every buffer — that must
+     * **not** bump [priorityGen] or in-flight Range jobs get cancelled/ignored and
+     * multi-conn appears "broken". Only real seeks bump the generation.
      */
     fun setPlayheadPriority(start: Long, endExclusive: Long) {
       val s = start.coerceAtLeast(0L)
       val e = min(endExclusive, config.totalSize).coerceAtLeast(s)
+      val prevStart = priorityStart.get()
+      val prevEnd = priorityEnd.get()
+      // Progressive BodyReader only moves start forward inside the current window —
+      // that must NOT count as a seek. Real seeks jump backward or far past prevEnd.
+      val isNewSeek = prevStart < 0L ||
+        s + PRIORITY_SEEK_DELTA < prevStart ||
+        s > prevEnd + PRIORITY_SEEK_DELTA
+
       priorityStart.set(s)
-      priorityEnd.set(e)
-      priorityGen.incrementAndGet()
+      // Grow the window forward while playing; on a real seek, replace the window.
+      priorityEnd.set(
+        if (isNewSeek) e else maxOf(e, prevEnd),
+      )
+      if (isNewSeek) {
+        priorityGen.incrementAndGet()
+        log("playhead priority SEEK $s-$e")
+      }
       priorityDeadlineMs.set(System.currentTimeMillis() + PRIORITY_TTL_MS)
-      log("playhead priority $s-$e")
     }
 
     private fun activePriorityWindow(): Pair<Long, Long>? {
@@ -561,7 +576,7 @@ class SegmentedHttpCache(
       val e = priorityEnd.get()
       if (s < 0L || e <= s) return null
       if (System.currentTimeMillis() > priorityDeadlineMs.get()) {
-        // Expire stale seek target so sequential fill can resume.
+        // Expire only when nothing has refreshed the deadline (no reads / seeks).
         priorityStart.compareAndSet(s, -1L)
         return null
       }
@@ -572,15 +587,15 @@ class SegmentedHttpCache(
      * Ensure [start, endExclusive) is cached. Uses **parallel** workers for holes
      * so seek does not wait on single-thread sequential fill.
      *
-     * Timeouts are intentionally short: returning partial coverage lets the proxy
-     * stream what it has instead of freezing mpv for tens of seconds.
+     * Timeouts are moderate: return as soon as the requested span is contiguous,
+     * but never cancel in-flight Range downloads just because the wait elapsed —
+     * those bytes are still needed for the next BodyReader iteration.
      */
     fun ensureRange(start: Long, endExclusive: Long, timeoutMs: Long): Boolean {
       val end = min(endExclusive, config.totalSize)
       if (start >= end) return true
-      // Only pin a modest ahead window — large multi-MB blocking prefills freeze seeks.
       setPlayheadPriority(start, min(end + config.chunkBytes.toLong(), start + MAX_PRIORITY_AHEAD))
-      val cappedTimeout = timeoutMs.coerceIn(250L, MAX_ENSURE_TIMEOUT_MS)
+      val cappedTimeout = timeoutMs.coerceIn(500L, MAX_ENSURE_TIMEOUT_MS)
       val deadline = System.currentTimeMillis() + cappedTimeout
       var spins = 0
       var lastHave = -1L
@@ -590,7 +605,7 @@ class SegmentedHttpCache(
         val holeStart = start + have
         val windowEnd = min(
           end,
-          holeStart + config.chunkBytes.toLong() * config.connections.coerceAtMost(4),
+          holeStart + config.chunkBytes.toLong() * config.connections.coerceAtMost(6),
         )
         val filled = fillWindowParallel(holeStart, windowEnd, deadline)
         val nowHave = store.contiguousFrom(start)
@@ -600,7 +615,7 @@ class SegmentedHttpCache(
         } else {
           spins++
           if (!filled || spins >= 2) {
-            runCatching { Thread.sleep(30L * spins.coerceAtMost(5)) }
+            runCatching { Thread.sleep(40L * spins.coerceAtMost(6)) }
           }
         }
         if (start + nowHave >= end) return true
@@ -610,6 +625,7 @@ class SegmentedHttpCache(
       if (!success) {
         log("ensureRange partial start=$start end=$end have=$finalHave")
       }
+      // Partial is OK — caller streams available bytes; downloads keep running.
       return success
     }
 
@@ -622,19 +638,19 @@ class SegmentedHttpCache(
       if (from >= end) return true
       if (store.isFullyCovered(from, end)) return true
       val chunk = config.chunkBytes.toLong()
-      // Cap concurrent jobs per ensure call so rapid seeks cannot flood the pool.
-      val workers = config.connections.coerceIn(2, 8)
+      val workers = config.connections.coerceIn(2, 12)
       val jobs = ArrayList<Future<*>>(workers)
       var pos = from
       var scheduled = 0
       val genAtStart = priorityGen.get()
       while (pos < end && scheduled < workers) {
         if (!running.get()) break
-        // Bail if a newer seek superseded this fill.
-        if (priorityGen.get() != genAtStart && from != priorityStart.get()) {
-          // Still allow fills that overlap the new priority start.
+        // Stop scheduling more slices if a real seek superseded this window.
+        if (priorityGen.get() != genAtStart) {
           val ps = priorityStart.get()
-          if (ps >= 0L && (pos + chunk < ps || pos > priorityEnd.get())) break
+          val pe = priorityEnd.get()
+          val overlaps = ps >= 0L && pos < pe && (pos + chunk) > ps
+          if (!overlaps) break
         }
         val already = store.contiguousFrom(pos)
         if (already > 0) {
@@ -654,14 +670,11 @@ class SegmentedHttpCache(
       if (jobs.isEmpty()) {
         return store.contiguousFrom(from) > 0 || store.isFullyCovered(from, end)
       }
-      // Short wait — do not block proxy threads for the full download timeout.
-      val waitMs = (deadline - System.currentTimeMillis()).coerceIn(50L, 2_500L)
+      // Wait for progress, but NEVER cancel in-flight Range GETs — cancelling them
+      // was the main reason multi-conn "stopped working" after the anti-stall patch.
+      val waitMs = (deadline - System.currentTimeMillis()).coerceIn(100L, 6_000L)
       jobs.forEach { f ->
         runCatching { f.get(waitMs, TimeUnit.MILLISECONDS) }
-      }
-      // Cancel stragglers so pool slots free up for the latest seek.
-      jobs.forEach { f ->
-        if (!f.isDone) f.cancel(false)
       }
       return store.contiguousFrom(from) > 0 || store.isFullyCovered(from, end)
     }
@@ -677,10 +690,11 @@ class SegmentedHttpCache(
     /**
      * Fill remaining file with parallel stripes, but **priority playhead first**.
      * Stale priority windows expire so a failed seek cannot freeze all progress.
+     * In-flight Range downloads are never cancelled — only new scheduling yields.
      */
     private fun stripeFillLoop(from: Long) {
       var pos = from
-      val stripe = config.connections.coerceIn(2, 8)
+      val stripe = config.connections.coerceIn(2, 12)
       val chunk = config.chunkBytes.toLong()
       while (running.get() && pos < config.totalSize) {
         // 1) Serve seek/playhead holes first (if still active).
@@ -689,10 +703,10 @@ class SegmentedHttpCache(
           val (pStart, pEnd) = priority
           val need = !store.isFullyCovered(pStart, pEnd)
           if (need) {
-            val deadline = System.currentTimeMillis() + 4_000L
+            val deadline = System.currentTimeMillis() + 8_000L
             fillWindowParallel(pStart, pEnd, deadline)
             if (!store.isFullyCovered(pStart, min(pEnd, config.totalSize))) {
-              runCatching { Thread.sleep(20) }
+              runCatching { Thread.sleep(30) }
               continue
             }
             log("priority window filled $pStart-$pEnd")
@@ -725,10 +739,11 @@ class SegmentedHttpCache(
           val end = min(config.totalSize, start + chunk) - 1
           stripePos = end + 1
           jobs += executor.submit {
-            // Drop background work if a newer seek needs the pool.
+            // Skip only if a real seek happened after schedule and this slice is
+            // far from the new playhead — do not drop work for progressive reads.
             if (priorityGen.get() != genAtSchedule) {
               val p = activePriorityWindow()
-              if (p != null && !store.isFullyCovered(p.first, p.second)) return@submit
+              if (p != null && (end < p.first || start > p.second)) return@submit
             }
             downloadRangeBlocking(start, end)
           }
@@ -747,9 +762,8 @@ class SegmentedHttpCache(
           continue
         }
         jobs.forEach { f ->
-          runCatching { f.get(8, TimeUnit.SECONDS) }
+          runCatching { f.get(30, TimeUnit.SECONDS) }
         }
-        jobs.forEach { f -> if (!f.isDone) f.cancel(false) }
         val progressed = store.contiguousFrom(pos)
         if (progressed <= 0) {
           val end = min(config.totalSize, pos + chunk) - 1
@@ -875,8 +889,8 @@ class SegmentedHttpCache(
     private fun handleClient(socket: Socket) {
       try {
         socket.tcpNoDelay = true
-        // Shorter idle timeout: abandoned seeks after scrubbing should free threads.
-        socket.soTimeout = 45_000
+        // Idle timeout for abandoned client sockets after scrubbing.
+        socket.soTimeout = 90_000
         val input = BufferedInputStream(socket.getInputStream())
         val output = BufferedOutputStream(socket.getOutputStream(), 64 * 1024)
         val request = readHttpRequest(input) ?: run {
@@ -898,14 +912,21 @@ class SegmentedHttpCache(
         if (range != null) {
           val (from, to) = range
           val length = to - from + 1
-          // Only block for the first slice of the requested range, then stream.
-          // Large prefill (old: 4–8MB / 60s) freezes rapid seeks and mid-play rebuffers.
-          val firstSlice = min(to + 1, from + config.chunkBytes.toLong())
+          // Block briefly for the first slice, then stream via BodyReader.
+          // Keep enough headroom for demux without multi-second freezes.
+          val firstSliceEnd = min(
+            to + 1,
+            from + maxOf(config.chunkBytes.toLong(), MIN_STREAM_BYTES),
+          )
           setPlayheadPriority(from, min(config.totalSize, from + MAX_PRIORITY_AHEAD))
-          val pre = ensureRange(from, firstSlice, 3_000L)
-          log("proxy 206 $from-$to firstSlice=$pre need=${firstSlice - from}")
-          // If the first byte is still missing, fail fast so mpv can reopen / reconnect
-          // instead of hanging on an empty progressive response.
+          val pre = ensureRange(from, firstSliceEnd, 8_000L)
+          log("proxy 206 $from-$to firstSlice=$pre need=${firstSliceEnd - from}")
+          // Only fail hard when we truly have nothing at the request start.
+          // Returning 503 too eagerly made multi-conn look completely broken.
+          if (store.contiguousFrom(from) <= 0L && !isHead) {
+            // One more longer attempt before giving up.
+            ensureRange(from, min(to + 1, from + MIN_STREAM_BYTES), 10_000L)
+          }
           if (store.contiguousFrom(from) <= 0L && !isHead) {
             log("proxy 503 no data at $from")
             writeResponse(output, 503, "Service Unavailable", "text/plain", 0, emptyMap(), null)
@@ -926,7 +947,7 @@ class SegmentedHttpCache(
             if (isHead) null else BodyReader(from, length),
           )
         } else {
-          val pre = ensureRange(0L, min(config.totalSize, 256 * 1024L), 3_000L)
+          val pre = ensureRange(0L, min(config.totalSize, 512 * 1024L), 8_000L)
           log("proxy 200 full firstSlice=$pre")
           writeResponse(
             output,
@@ -952,24 +973,26 @@ class SegmentedHttpCache(
         var remaining = length
         var pos = start
         var idleRounds = 0
-        val bodyDeadline = System.currentTimeMillis() + BODY_READ_TIMEOUT_MS * 4
-        // Modest ahead window — large 8MB pins starved the pool under scrubbing.
-        val ahead = maxOf(config.chunkBytes.toLong() * 2L, MAX_PRIORITY_AHEAD)
-        while (remaining > 0 && running.get() && System.currentTimeMillis() < bodyDeadline) {
+        // No hard total-body deadline — long progressive files must stream for minutes.
+        // Only abort after sustained no-progress (idleRounds), which still unsticks seeks.
+        val ahead = maxOf(config.chunkBytes.toLong() * 3L, MAX_PRIORITY_AHEAD)
+        while (remaining > 0 && running.get()) {
           val want = min(buf.size.toLong(), remaining).toInt()
-          // Request just enough to fill the next write; background priority does the rest.
-          val needEnd = min(pos + maxOf(want.toLong(), MIN_STREAM_BYTES), pos + remaining)
+          val needEnd = min(
+            pos + maxOf(want.toLong(), MIN_STREAM_BYTES),
+            pos + remaining,
+          )
           setPlayheadPriority(pos, min(config.totalSize, pos + ahead))
-          val ok = ensureRange(pos, needEnd, 2_500L)
+          val ok = ensureRange(pos, needEnd, 6_000L)
           val avail = store.contiguousFrom(pos).toInt()
           if (avail <= 0) {
             idleRounds++
-            if (!ok || idleRounds > BODY_IDLE_ROUNDS_MAX) {
-              log("BodyReader abort at $pos remain=$remaining idle=$idleRounds")
+            if (idleRounds > BODY_IDLE_ROUNDS_MAX) {
+              log("BodyReader abort at $pos remain=$remaining idle=$idleRounds ok=$ok")
               // Abort without padding — client sees connection close mid-body and retries.
               break
             }
-            runCatching { Thread.sleep(40) }
+            runCatching { Thread.sleep(50) }
             continue
           }
           idleRounds = 0
