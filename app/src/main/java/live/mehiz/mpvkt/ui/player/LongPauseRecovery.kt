@@ -57,17 +57,14 @@ object LongPauseRecovery {
 
   private fun resolveRecovery(): RecoveryTarget? {
     val started = pausedAtElapsedMs.get()
-    if (started <= 0L) return null
-    val idleMs = SystemClock.elapsedRealtime() - started
-    if (idleMs < LONG_PAUSE_RECOVER_MS) return null
+    val idleMs = if (started > 0L) SystemClock.elapsedRealtime() - started else 0L
+    if (started <= 0L || idleMs < LONG_PAUSE_RECOVER_MS) return null
 
     val path = MPVLib.getPropertyString("path").orEmpty()
     val pos = MPVLib.getPropertyDouble("time-pos")
-    return if (isNetworkLikePath(path) && pos != null) {
-      RecoveryTarget(idleMs = idleMs, pos = pos, path = path)
-    } else {
-      null
-    }
+    return pos
+      ?.takeIf { isNetworkLikePath(path) }
+      ?.let { RecoveryTarget(idleMs = idleMs, pos = it, path = path) }
   }
 
   private fun isNetworkLikePath(path: String): Boolean {
