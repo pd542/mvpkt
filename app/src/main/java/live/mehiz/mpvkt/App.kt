@@ -6,6 +6,7 @@ import live.mehiz.mpvkt.di.DatabaseModule
 import live.mehiz.mpvkt.di.FileManagerModule
 import live.mehiz.mpvkt.di.PreferencesModule
 import live.mehiz.mpvkt.di.ViewModelModule
+import live.mehiz.mpvkt.network.DiagLog
 import live.mehiz.mpvkt.presentation.crash.CrashActivity
 import live.mehiz.mpvkt.presentation.crash.GlobalExceptionHandler
 import org.koin.android.ext.koin.androidContext
@@ -17,6 +18,14 @@ import org.koin.dsl.koinConfiguration
 class App : Application(), KoinStartup {
   override fun onCreate() {
     super.onCreate()
+    // Create Android/data/<pkg>/files/logs as soon as the process starts
+    // (not only when PlayerActivity opens a URL).
+    val logPath = DiagLog.setupDefault(this)
+    DiagLog.e(
+      "App",
+      "onCreate version=${BuildConfig.VERSION_NAME} " +
+        "code=${BuildConfig.VERSION_CODE} sha=${BuildConfig.GIT_SHA} log=$logPath",
+    )
     Thread.setDefaultUncaughtExceptionHandler(GlobalExceptionHandler(applicationContext, CrashActivity::class.java))
   }
 

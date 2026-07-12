@@ -21,8 +21,9 @@ android {
     applicationId = "live.mehiz.mpvkt"
     minSdk = 21
     targetSdk = 36
-    versionCode = 12
-    versionName = "0.1.6"
+    // Bump so devices can verify the log-path fix APK was actually installed.
+    versionCode = 13
+    versionName = "0.1.7-seglog"
 
     vectorDrawables {
       useSupportLibrary = true
