@@ -22,8 +22,13 @@
 -dontobfuscate
 -keep,allowoptimization class is.xyz.mpv.** { public protected *; }
 
-# Keep multi-connection proxy class + stack traces for field debugging.
+# Keep multi-connection diagnostics for release field debugging.
+# Note: proguard-android-optimize.txt strips Log.v/d/i/w/e call sites.
+# We log via android.util.Log.println (not stripped) + DiagLog file mirror.
 -keep class live.mehiz.mpvkt.network.SegmentedHttpCache { *; }
+-keep class live.mehiz.mpvkt.network.DiagLog { *; }
+-keepclassmembers class android.util.Log {
+    public static int println(int, java.lang.String, java.lang.String);
+    public static java.lang.String getStackTraceString(java.lang.Throwable);
+}
 -keepattributes SourceFile,LineNumberTable
-# Log.e / Log.w are not stripped by proguard-android-optimize; SegmentedHttpCache
-# and PlayerActivity use Log.e so release APKs still emit segmented diagnostics.

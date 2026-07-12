@@ -13,11 +13,9 @@
 
 package live.mehiz.mpvkt.network
 
-import android.util.Log
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.File
-import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.io.RandomAccessFile
@@ -26,8 +24,6 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.Locale
 import java.util.TreeMap
 import java.util.concurrent.Executors
@@ -57,7 +53,6 @@ class SegmentedHttpCache(
   private val userAgent: String = DEFAULT_UA,
 ) {
   private var session: Session? = null
-  private val logFile: File = File(cacheDir, "segmented-debug.log")
 
   data class OpenResult(
     /** URL/path for mpv loadfile (localhost proxy when segmented). */
@@ -77,6 +72,8 @@ class SegmentedHttpCache(
    * and [OpenResult.usedSegmented] is false.
    */
   fun open(originalUrl: String): OpenResult {
+    // Point file logger at this session's cache dir (release-safe).
+    DiagLog.file = File(cacheDir, "segmented-debug.log")
     logE("open() url=$originalUrl conn=$connections chunk=$chunkBytes")
     if (!isAcceleratableUrl(originalUrl)) {
       logE("skip: not acceleratable url")
@@ -153,23 +150,9 @@ class SegmentedHttpCache(
     logE("shutdown")
   }
 
-  /** Always Log.e so release minify keeps the call; also mirror to a file. */
+  /** Release-safe logger ([DiagLog] uses Log.println so R8 won't strip it). */
   private fun logE(msg: String, err: Throwable? = null) {
-    if (err != null) {
-      Log.e(TAG, msg, err)
-    } else {
-      Log.e(TAG, msg)
-    }
-    runCatching {
-      cacheDir.mkdirs()
-      val ts = TIME_FMT.format(Date())
-      FileOutputStream(logFile, true).bufferedWriter().use { w ->
-        w.append(ts).append(' ').append(msg).append('\n')
-        if (err != null) {
-          w.append(ts).append(' ').append(Log.getStackTraceString(err)).append('\n')
-        }
-      }
-    }
+    DiagLog.e(TAG, msg, err)
   }
 
   companion object {
@@ -189,7 +172,6 @@ class SegmentedHttpCache(
     private const val MIN_FILE_FOR_ACCEL = 3L * 1024L * 1024L
     private const val CONNECT_TIMEOUT_MS = 15_000
     private const val READ_TIMEOUT_MS = 30_000
-    private val TIME_FMT = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
     fun isAcceleratableUrl(url: String): Boolean {
       val lower = url.lowercase(Locale.US)
@@ -231,7 +213,7 @@ class SegmentedHttpCache(
           ProbeResult(acceptRanges && len > 0, len, type, finalUrl)
         }
       } catch (e: Exception) {
-        Log.e(TAG, "probe error: ${e.message}", e)
+        DiagLog.e(TAG, "probe error: ${e.message}", e)
         runCatching { conn.disconnect() }
         ProbeResult(false, -1L, null, url)
       }

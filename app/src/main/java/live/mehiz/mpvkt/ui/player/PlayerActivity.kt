@@ -53,6 +53,7 @@ import live.mehiz.mpvkt.database.entities.CustomButtonEntity
 import live.mehiz.mpvkt.database.entities.PlaybackStateEntity
 import live.mehiz.mpvkt.databinding.PlayerLayoutBinding
 import live.mehiz.mpvkt.domain.playbackstate.repository.PlaybackStateRepository
+import live.mehiz.mpvkt.network.DiagLog
 import live.mehiz.mpvkt.network.SegmentedHttpCache
 import live.mehiz.mpvkt.preferences.AdvancedPreferences
 import live.mehiz.mpvkt.preferences.AudioPreferences
@@ -141,12 +142,14 @@ class PlayerActivity : AppCompatActivity() {
   }
 
   private fun startPlayback(intent: Intent, useLoadfileCommand: Boolean) {
+    // File log is always available even when logcat is filtered / R8-minified.
+    DiagLog.file = File(cacheDir, "segmented-http/segmented-debug.log")
     val source = resolvePlayableUri(intent)
     if (source == null) {
-      Log.e(TAG, "No playable URI in intent")
+      DiagLog.e(TAG, "No playable URI in intent")
       return
     }
-    Log.e(
+    DiagLog.e(
       TAG,
       "startPlayback source=$source multi=${networkPreferences.multiConnectionDownload.get()}",
     )
@@ -156,7 +159,7 @@ class PlayerActivity : AppCompatActivity() {
 
     if (!wantSegmented) {
       // Direct play — same as upstream mpvKt.
-      Log.e(TAG, "direct play (segmented off or non-http): $source")
+      DiagLog.e(TAG, "direct play (segmented off or non-http): $source")
       playUri(source, useLoadfileCommand)
       return
     }
@@ -166,17 +169,17 @@ class PlayerActivity : AppCompatActivity() {
     lifecycleScope.launch {
       val playable = withContext(Dispatchers.IO) {
         runCatching { maybeAccelerateHttp(source) }
-          .onFailure { Log.e(TAG, "maybeAccelerateHttp failed: ${it.message}", it) }
+          .onFailure { DiagLog.e(TAG, "maybeAccelerateHttp failed: ${it.message}", it) }
           .getOrDefault(source)
       }
-      Log.e(TAG, "playable path=$playable (source=$source)")
+      DiagLog.e(TAG, "playable path=$playable (source=$source)")
       playUri(playable, useLoadfileCommand)
     }
   }
 
   private fun playUri(uri: String, useLoadfileCommand: Boolean) {
-    // Use Log.e so messages survive release filtering / minification.
-    Log.e(TAG, "Loading media: $uri loadfile=$useLoadfileCommand")
+    // DiagLog uses Log.println — not stripped by R8 optimize.
+    DiagLog.e(TAG, "Loading media: $uri loadfile=$useLoadfileCommand")
     if (useLoadfileCommand) {
       MPVLib.command("loadfile", uri)
     } else {
@@ -201,7 +204,7 @@ class PlayerActivity : AppCompatActivity() {
    */
   private fun maybeAccelerateHttp(uri: String): String {
     if (!SegmentedHttpCache.isAcceleratableUrl(uri)) {
-      Log.e(TAG, "not acceleratable: $uri")
+      DiagLog.e(TAG, "not acceleratable: $uri")
       return uri
     }
 
@@ -211,7 +214,8 @@ class PlayerActivity : AppCompatActivity() {
     val connections = networkPreferences.multiConnectionCount.get().coerceIn(2, 16)
     val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 4096)
     val cacheRoot = File(cacheDir, "segmented-http").also { it.mkdirs() }
-    Log.e(TAG, "accelerate start conn=$connections chunkKb=$chunkKb cache=$cacheRoot")
+    DiagLog.file = File(cacheRoot, "segmented-debug.log")
+    DiagLog.e(TAG, "accelerate start conn=$connections chunkKb=$chunkKb cache=$cacheRoot")
     val accelerator = SegmentedHttpCache(
       cacheDir = cacheRoot,
       connections = connections,
@@ -220,14 +224,14 @@ class PlayerActivity : AppCompatActivity() {
     val result = accelerator.open(uri)
     return if (result.usedSegmented) {
       segmentedHttpCache = accelerator
-      Log.e(
+      DiagLog.e(
         TAG,
         "Segmented ON: $uri → ${result.playPath} ($connections x ${chunkKb}KiB)",
       )
       result.playPath
     } else {
       accelerator.close()
-      Log.e(TAG, "Segmented pass-through (direct): $uri")
+      DiagLog.e(TAG, "Segmented pass-through (direct): $uri")
       uri
     }
   }
