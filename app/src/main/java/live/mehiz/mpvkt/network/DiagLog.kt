@@ -37,8 +37,13 @@ object DiagLog {
   fun paths(): List<String> = sinks.map { it.absolutePath }
 
   @JvmStatic
-  fun configure(vararg files: File?) {
+  fun configure(files: Collection<File?>) {
     sinks = files.filterNotNull().distinctBy { it.absolutePath }
+  }
+
+  @JvmStatic
+  fun configure(vararg files: File?) {
+    configure(files.asList())
   }
 
   /**
@@ -83,12 +88,12 @@ object DiagLog {
       if (ok) usable += f
     }
 
-    configure(*usable.toTypedArray())
+    configure(usable)
 
     val primary = usable.firstOrNull()
       ?: File(app.filesDir, "logs/$LOG_NAME").also {
         runCatching { it.parentFile?.mkdirs() }
-        configure(it)
+        configure(listOf(it))
       }
 
     val pkg = app.packageName
