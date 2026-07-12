@@ -468,6 +468,7 @@ class SegmentedHttpCache(
     val store = ContiguousStore()
     val cacheFile: File =
       File(cacheDir, "seg_${config.originUrl.hashCode().toUInt()}_${config.totalSize}.bin")
+    private val indexFile: File = File(cacheFile.absolutePath + ".ranges")
     private val raf: RandomAccessFile
     private val executor: ThreadPoolExecutor
     private val serverExecutor = Executors.newCachedThreadPool()
@@ -482,8 +483,11 @@ class SegmentedHttpCache(
 
     init {
       cacheDir.mkdirs()
-      if (cacheFile.exists()) {
+      if (cacheFile.exists() && cacheFile.length() == config.totalSize) {
+        loadIndex()
+      } else {
         runCatching { cacheFile.delete() }
+        runCatching { indexFile.delete() }
       }
       raf = RandomAccessFile(cacheFile, "rw")
       raf.setLength(config.totalSize)
@@ -783,6 +787,7 @@ class SegmentedHttpCache(
           written += w
           downloaded.addAndGet(w.toLong())
           store.mark(from, writePos)
+          persistIndex()
         }
       } finally {
         runCatching { input.close() }
@@ -918,7 +923,38 @@ class SegmentedHttpCache(
       serverExecutor.shutdownNow()
       runCatching { serverSocket?.close() }
       runCatching { raf.close() }
-      if (deleteCache) runCatching { cacheFile.delete() }
+      if (deleteCache) {
+        runCatching { cacheFile.delete() }
+        runCatching { indexFile.delete() }
+      }
+    }
+
+    private fun loadIndex() {
+      if (!indexFile.exists()) return
+      runCatching {
+        indexFile.forEachLine { line ->
+          val sep = line.indexOf('-')
+          if (sep <= 0) return@forEachLine
+          val start = line.substring(0, sep).toLongOrNull() ?: return@forEachLine
+          val end = line.substring(sep + 1).toLongOrNull() ?: return@forEachLine
+          if (start >= 0L && end > start && end <= config.totalSize) {
+            store.mark(start, end)
+          }
+        }
+      }.onFailure {
+        store.clear()
+        runCatching { indexFile.delete() }
+      }
+    }
+
+    private fun persistIndex() {
+      val ranges = store.snapshot()
+      runCatching {
+        indexFile.parentFile?.mkdirs()
+        indexFile.writeText(ranges.joinToString(separator = "\n", postfix = "\n") { (start, end) ->
+          "$start-$end"
+        })
+      }
     }
 
     private data class HttpRequest(
@@ -1043,6 +1079,14 @@ class SegmentedHttpCache(
     fun isFullyCovered(start: Long, endExclusive: Long): Boolean = synchronized(lock) {
       val entry = map.floorEntry(start)
       entry != null && entry.value >= endExclusive
+    }
+
+    fun snapshot(): List<Pair<Long, Long>> = synchronized(lock) {
+      map.map { it.key to it.value }
+    }
+
+    fun clear() = synchronized(lock) {
+      map.clear()
     }
   }
 }

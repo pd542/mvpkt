@@ -207,7 +207,7 @@ class PlayerActivity : AppCompatActivity() {
   private fun maybeAccelerateHttp(uri: String): String {
     if (!SegmentedHttpCache.shouldTryAccelerate(uri)) return uri
 
-    clearSegmentedPlaybackCache()
+    closeSegmentedPlaybackCache()
 
     val connections = networkPreferences.multiConnectionCount.get().coerceIn(2, 16)
     val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 4096)
@@ -225,6 +225,11 @@ class PlayerActivity : AppCompatActivity() {
       accelerator.deleteCache()
       uri
     }
+  }
+
+  private fun closeSegmentedPlaybackCache() {
+    segmentedHttpCache?.close()
+    segmentedHttpCache = null
   }
 
   private fun clearSegmentedPlaybackCache() {
@@ -251,7 +256,7 @@ class PlayerActivity : AppCompatActivity() {
     }
     MPVLib.removeObserver(playerObserver)
     MPVLib.destroy()
-    clearSegmentedPlaybackCache()
+    closeSegmentedPlaybackCache()
 
     super.onDestroy()
   }
@@ -754,8 +759,8 @@ class PlayerActivity : AppCompatActivity() {
   override fun onNewIntent(intent: Intent) {
     super.onNewIntent(intent)
     setIntent(intent)
-    // Clear previous multi-conn session before opening a new URL.
-    clearSegmentedPlaybackCache()
+    // Close previous multi-conn session before opening a new URL while keeping reusable cache.
+    closeSegmentedPlaybackCache()
     startPlayback(intent, useLoadfileCommand = true)
   }
 
