@@ -21,3 +21,9 @@
 #-renamesourcefileattribute SourceFile
 -dontobfuscate
 -keep,allowoptimization class is.xyz.mpv.** { public protected *; }
+
+# Keep multi-connection proxy class + stack traces for field debugging.
+-keep class live.mehiz.mpvkt.network.SegmentedHttpCache { *; }
+-keepattributes SourceFile,LineNumberTable
+# Log.e / Log.w are not stripped by proguard-android-optimize; SegmentedHttpCache
+# and PlayerActivity use Log.e so release APKs still emit segmented diagnostics.

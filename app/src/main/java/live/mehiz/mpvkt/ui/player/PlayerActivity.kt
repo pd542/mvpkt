@@ -146,12 +146,14 @@ class PlayerActivity : AppCompatActivity() {
       Log.e(TAG, "No playable URI in intent")
       return
     }
+    Log.e(TAG, "startPlayback source=$source multi=${networkPreferences.multiConnectionDownload.get()}")
 
     val wantSegmented = networkPreferences.multiConnectionDownload.get() &&
       SegmentedHttpCache.isAcceleratableUrl(source)
 
     if (!wantSegmented) {
       // Direct play — same as upstream mpvKt.
+      Log.e(TAG, "direct play (segmented off or non-http): $source")
       playUri(source, useLoadfileCommand)
       return
     }
@@ -160,14 +162,18 @@ class PlayerActivity : AppCompatActivity() {
     // On failure, open() already returns the original URL.
     lifecycleScope.launch {
       val playable = withContext(Dispatchers.IO) {
-        runCatching { maybeAccelerateHttp(source) }.getOrDefault(source)
+        runCatching { maybeAccelerateHttp(source) }
+          .onFailure { Log.e(TAG, "maybeAccelerateHttp failed: ${it.message}", it) }
+          .getOrDefault(source)
       }
+      Log.e(TAG, "playable path=$playable (source=$source)")
       playUri(playable, useLoadfileCommand)
     }
   }
 
   private fun playUri(uri: String, useLoadfileCommand: Boolean) {
-    Log.i(TAG, "Loading media: $uri")
+    // Use Log.e so messages survive release filtering / minification.
+    Log.e(TAG, "Loading media: $uri loadfile=$useLoadfileCommand")
     if (useLoadfileCommand) {
       MPVLib.command("loadfile", uri)
     } else {
@@ -187,11 +193,12 @@ class PlayerActivity : AppCompatActivity() {
 
   /**
    * Optional multi-connection Range download.
-   * Returns a **local file path** when segmented mode is active (mpv-safe),
+   * Returns a localhost proxy URL when segmented mode is active,
    * otherwise the original remote URL.
    */
   private fun maybeAccelerateHttp(uri: String): String {
     if (!SegmentedHttpCache.isAcceleratableUrl(uri)) {
+      Log.e(TAG, "not acceleratable: $uri")
       return uri
     }
 
@@ -201,6 +208,7 @@ class PlayerActivity : AppCompatActivity() {
     val connections = networkPreferences.multiConnectionCount.get().coerceIn(2, 16)
     val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 4096)
     val cacheRoot = File(cacheDir, "segmented-http").also { it.mkdirs() }
+    Log.e(TAG, "accelerate start conn=$connections chunkKb=$chunkKb cache=$cacheRoot")
     val accelerator = SegmentedHttpCache(
       cacheDir = cacheRoot,
       connections = connections,
@@ -209,14 +217,14 @@ class PlayerActivity : AppCompatActivity() {
     val result = accelerator.open(uri)
     return if (result.usedSegmented) {
       segmentedHttpCache = accelerator
-      Log.i(
+      Log.e(
         TAG,
         "Segmented ON: $uri → ${result.playPath} ($connections x ${chunkKb}KiB)",
       )
       result.playPath
     } else {
       accelerator.close()
-      Log.i(TAG, "Segmented pass-through (direct): $uri")
+      Log.e(TAG, "Segmented pass-through (direct): $uri")
       uri
     }
   }
