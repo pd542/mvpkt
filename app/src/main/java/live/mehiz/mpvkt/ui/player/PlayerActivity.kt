@@ -146,7 +146,10 @@ class PlayerActivity : AppCompatActivity() {
       Log.e(TAG, "No playable URI in intent")
       return
     }
-    Log.e(TAG, "startPlayback source=$source multi=${networkPreferences.multiConnectionDownload.get()}")
+    Log.e(
+      TAG,
+      "startPlayback source=$source multi=${networkPreferences.multiConnectionDownload.get()}",
+    )
 
     val wantSegmented = networkPreferences.multiConnectionDownload.get() &&
       SegmentedHttpCache.isAcceleratableUrl(source)

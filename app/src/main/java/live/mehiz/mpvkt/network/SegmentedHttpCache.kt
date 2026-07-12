@@ -57,7 +57,6 @@ class SegmentedHttpCache(
   private val chunkBytes: Int,
   private val userAgent: String = DEFAULT_UA,
 ) {
-  private val closed = AtomicBoolean(false)
   private var session: Session? = null
   private val logFile: File = File(cacheDir, "segmented-debug.log")
 
@@ -150,7 +149,6 @@ class SegmentedHttpCache(
   fun close() = shutdownQuietly()
 
   private fun shutdownQuietly() {
-    closed.set(true)
     session?.close()
     session = null
     logE("shutdown")
@@ -276,13 +274,12 @@ class SegmentedHttpCache(
     cacheDir: File,
     private val log: (String) -> Unit,
   ) {
-    val store = ContiguousStore(config.totalSize)
+    val store = ContiguousStore()
     val cacheFile: File =
       File(cacheDir, "seg_${config.originUrl.hashCode().toUInt()}_${config.totalSize}.bin")
     private val raf: RandomAccessFile
     private val executor: ThreadPoolExecutor
     private val serverExecutor = Executors.newCachedThreadPool()
-    private val futures = mutableListOf<Future<*>>()
     private val running = AtomicBoolean(true)
     private val downloaded = AtomicLong(0)
     private var serverSocket: ServerSocket? = null
@@ -598,7 +595,6 @@ class SegmentedHttpCache(
 
     fun close() {
       running.set(false)
-      futures.forEach { it.cancel(true) }
       executor.shutdownNow()
       serverExecutor.shutdownNow()
       runCatching { serverSocket?.close() }
@@ -694,7 +690,7 @@ class SegmentedHttpCache(
     }
   }
 
-  class ContiguousStore(private val totalSize: Long) {
+  class ContiguousStore {
     private val lock = Object()
     private val map = TreeMap<Long, Long>()
 
@@ -728,20 +724,6 @@ class SegmentedHttpCache(
     fun isFullyCovered(start: Long, endExclusive: Long): Boolean = synchronized(lock) {
       val entry = map.floorEntry(start)
       entry != null && entry.value >= endExclusive
-    }
-
-    fun waitContiguous(pos: Long, length: Long, timeoutMs: Long): Boolean {
-      val needEnd = min(totalSize, pos + length)
-      val deadline = System.currentTimeMillis() + timeoutMs
-      synchronized(lock) {
-        while (true) {
-          val avail = contiguousFrom(pos)
-          if (pos + avail >= needEnd) return true
-          val remaining = deadline - System.currentTimeMillis()
-          if (remaining <= 0) return pos + avail > pos
-          lock.wait(min(remaining, 100L))
-        }
-      }
     }
   }
 }
