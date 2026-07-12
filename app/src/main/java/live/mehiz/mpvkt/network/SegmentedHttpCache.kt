@@ -176,19 +176,81 @@ class SegmentedHttpCache(
     fun isAcceleratableUrl(url: String): Boolean {
       val lower = url.lowercase(Locale.US)
       if (!lower.startsWith("http://") && !lower.startsWith("https://")) return false
+      // Adaptive streaming — mpv handles natively.
       val adaptive = lower.contains(".m3u8") ||
         lower.contains(".mpd") ||
         lower.contains("format=m3u") ||
         lower.contains("type=m3u8") ||
         lower.contains("/hls/") ||
         lower.contains("playlist")
-      return !adaptive
+      if (adaptive) return false
+      // Signed / one-shot download links (Alist/OpenList, S3, CDN).
+      // A Range probe can burn the token so even "fallback direct" then fails.
+      if (looksSignedOrOneShot(lower)) {
+        DiagLog.e(TAG, "skip acceleratable: signed/one-shot url")
+        return false
+      }
+      return true
+    }
+
+    /**
+     * True for URLs whose query/path looks like a short-lived download signature.
+     * Multi-connection must never touch these before playback — a failed Range
+     * probe can invalidate the token (Alist/OpenList `?sign=`, S3, OSS, …).
+     */
+    fun looksSignedOrOneShot(urlLower: String): Boolean {
+      val strong = arrayOf(
+        "sign=",
+        "signature=",
+        "x-amz-signature=",
+        "x-amz-credential=",
+        "x-oss-signature=",
+        "auth_key=",
+        "authkey=",
+        "access_token=",
+        "wssecret=",
+        "wstime=",
+        "usig=",
+      )
+      if (strong.any { urlLower.contains(it) }) return true
+      // Local file managers (Alist/OpenList on LAN) often serve /d/ with one-shot auth.
+      if (urlLower.contains("localhost") || urlLower.contains("127.0.0.1")) {
+        if (urlLower.contains("/d/") || urlLower.contains("token=")) return true
+      }
+      return false
     }
 
     fun probe(url: String, userAgent: String = DEFAULT_UA): ProbeResult {
+      // Prefer HEAD first — does not download body and is safer for signed URLs
+      // that somehow still reached probe.
+      val head = probeOnce(url, userAgent, useHead = true)
+      if (head.supportsRange && head.contentLength >= MIN_FILE_FOR_ACCEL && !isHtmlType(head.contentType)) {
+        return head
+      }
+      // Fallback tiny Range GET only when HEAD did not prove Range support.
+      val get = probeOnce(url, userAgent, useHead = false)
+      if (isHtmlType(get.contentType) || get.contentLength in 1 until 8 * 1024) {
+        // HTML error page or tiny payload — not a progressive video.
+        DiagLog.e(
+          TAG,
+          "probe rejects non-media type=${get.contentType} len=${get.contentLength}",
+        )
+        return ProbeResult(false, get.contentLength, get.contentType, get.finalUrl)
+      }
+      return get
+    }
+
+    private fun isHtmlType(type: String?): Boolean {
+      val t = type?.lowercase(Locale.US) ?: return false
+      return t.contains("text/html") || t.contains("application/xhtml")
+    }
+
+    private fun probeOnce(url: String, userAgent: String, useHead: Boolean): ProbeResult {
       val conn = openConnection(url, userAgent).apply {
-        requestMethod = "GET"
-        setRequestProperty("Range", "bytes=0-0")
+        requestMethod = if (useHead) "HEAD" else "GET"
+        if (!useHead) {
+          setRequestProperty("Range", "bytes=0-0")
+        }
         instanceFollowRedirects = true
         connectTimeout = CONNECT_TIMEOUT_MS
         readTimeout = READ_TIMEOUT_MS
@@ -198,22 +260,32 @@ class SegmentedHttpCache(
         val code = conn.responseCode
         val finalUrl = conn.url.toString()
         val type = conn.contentType
-        if (code == HttpURLConnection.HTTP_PARTIAL) {
-          val total = parseTotalFromContentRange(conn.getHeaderField("Content-Range")) ?: -1L
-          runCatching { conn.inputStream.close() }
-          conn.disconnect()
-          ProbeResult(total > 0, total, type, finalUrl)
-        } else {
-          val len = conn.getHeaderFieldLong("Content-Length", -1L)
-          val acceptRanges = conn.getHeaderField("Accept-Ranges")
-            ?.lowercase(Locale.US)
-            ?.contains("bytes") == true
-          conn.disconnect()
-          // Some CDNs answer 200 to bytes=0-0 but still allow Range later.
-          ProbeResult(acceptRanges && len > 0, len, type, finalUrl)
+        val acceptRanges = conn.getHeaderField("Accept-Ranges")
+          ?.lowercase(Locale.US)
+          ?.contains("bytes") == true
+        when {
+          code == HttpURLConnection.HTTP_PARTIAL -> {
+            val total = parseTotalFromContentRange(conn.getHeaderField("Content-Range")) ?: -1L
+            runCatching { if (!useHead) conn.inputStream.close() }
+            conn.disconnect()
+            ProbeResult(total > 0 && !isHtmlType(type), total, type, finalUrl)
+          }
+          code == HttpURLConnection.HTTP_OK -> {
+            val len = conn.getHeaderFieldLong("Content-Length", -1L)
+            runCatching { if (!useHead) conn.inputStream.close() }
+            conn.disconnect()
+            // HEAD/GET 200: only enable multi-conn when server advertises ranges
+            // and payload looks large enough to be a real media file.
+            val ok = acceptRanges && len >= MIN_FILE_FOR_ACCEL && !isHtmlType(type)
+            ProbeResult(ok, len, type, finalUrl)
+          }
+          else -> {
+            conn.disconnect()
+            ProbeResult(false, -1L, type, finalUrl)
+          }
         }
       } catch (e: Exception) {
-        DiagLog.e(TAG, "probe error: ${e.message}", e)
+        DiagLog.e(TAG, "probe error head=$useHead: ${e.message}", e)
         runCatching { conn.disconnect() }
         ProbeResult(false, -1L, null, url)
       }
