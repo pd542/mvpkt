@@ -207,7 +207,8 @@ class PlayerActivity : AppCompatActivity() {
   private fun maybeAccelerateHttp(uri: String): String {
     if (!SegmentedHttpCache.shouldTryAccelerate(uri)) return uri
 
-    closeSegmentedPlaybackCache()
+    // Drop previous media's on-disk segments before starting a new download.
+    clearSegmentedPlaybackCache()
 
     val connections = networkPreferences.multiConnectionCount.get().coerceIn(2, 16)
     val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 4096)
@@ -227,14 +228,24 @@ class PlayerActivity : AppCompatActivity() {
     }
   }
 
-  private fun closeSegmentedPlaybackCache() {
-    segmentedHttpCache?.close()
-    segmentedHttpCache = null
-  }
-
+  /**
+   * Stop multi-conn proxy and delete all segmented media files under app cache.
+   * Called on player exit, media switch, and end-of-file so app data does not grow.
+   */
   private fun clearSegmentedPlaybackCache() {
     segmentedHttpCache?.deleteCache()
     segmentedHttpCache = null
+    purgeSegmentedHttpCacheDir()
+  }
+
+  private fun purgeSegmentedHttpCacheDir() {
+    val root = File(cacheDir, "segmented-http")
+    if (!root.exists()) return
+    root.listFiles()?.forEach { child ->
+      runCatching {
+        if (child.isDirectory) child.deleteRecursively() else child.delete()
+      }
+    }
   }
 
   override fun onDestroy() {
@@ -256,7 +267,8 @@ class PlayerActivity : AppCompatActivity() {
     }
     MPVLib.removeObserver(playerObserver)
     MPVLib.destroy()
-    closeSegmentedPlaybackCache()
+    // Always wipe segmented multi-conn data when leaving the player.
+    clearSegmentedPlaybackCache()
 
     super.onDestroy()
   }
@@ -759,8 +771,8 @@ class PlayerActivity : AppCompatActivity() {
   override fun onNewIntent(intent: Intent) {
     super.onNewIntent(intent)
     setIntent(intent)
-    // Close previous multi-conn session before opening a new URL while keeping reusable cache.
-    closeSegmentedPlaybackCache()
+    // Switching media: stop previous multi-conn session and delete its cache files.
+    clearSegmentedPlaybackCache()
     startPlayback(intent, useLoadfileCommand = true)
   }
 
