@@ -10,12 +10,13 @@ import java.util.Locale
 /**
  * Diagnostics logger that **survives R8 release minify**.
  *
- * `proguard-android-optimize.txt` marks [Log.v]/[Log.d]/[Log.i],[Log.w],[Log.e]
- * as side-effect-free and deletes those call sites. [Log.println] is **not** in that
- * list, so ERROR-priority lines still appear in logcat for release APKs.
+ * proguard-android-optimize strips Log.v / Log.d / Log.i / Log.w / Log.e
+ * call sites as side-effect-free. Log.println is not in that list, so
+ * ERROR-priority lines still appear in logcat for release APKs.
  *
  * Also mirrors to a file under the app cache when [file] is set.
  */
+
 object DiagLog {
   @Volatile
   var file: File? = null
