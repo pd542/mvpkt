@@ -142,8 +142,10 @@ class PlayerActivity : AppCompatActivity() {
   }
 
   private fun startPlayback(intent: Intent, useLoadfileCommand: Boolean) {
-    // File log is always available even when logcat is filtered / R8-minified.
-    DiagLog.file = File(cacheDir, "segmented-http/segmented-debug.log")
+    // External: Android/data/<package>/files/logs/segmented-debug.log (no root needed)
+    // Internal fallback: cacheDir/segmented-http/segmented-debug.log
+    val logPath = DiagLog.setupDefault(this)
+    DiagLog.e(TAG, "playback start; file log=$logPath")
     val source = resolvePlayableUri(intent)
     if (source == null) {
       DiagLog.e(TAG, "No playable URI in intent")
@@ -214,7 +216,8 @@ class PlayerActivity : AppCompatActivity() {
     val connections = networkPreferences.multiConnectionCount.get().coerceIn(2, 16)
     val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 4096)
     val cacheRoot = File(cacheDir, "segmented-http").also { it.mkdirs() }
-    DiagLog.file = File(cacheRoot, "segmented-debug.log")
+    // Keep dual sinks (external + internal); do not overwrite with internal-only path.
+    DiagLog.setupDefault(this)
     DiagLog.e(TAG, "accelerate start conn=$connections chunkKb=$chunkKb cache=$cacheRoot")
     val accelerator = SegmentedHttpCache(
       cacheDir = cacheRoot,

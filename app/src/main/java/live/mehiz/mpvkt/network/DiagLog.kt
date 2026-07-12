@@ -1,5 +1,6 @@
 package live.mehiz.mpvkt.network
 
+import android.content.Context
 import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
@@ -14,14 +15,53 @@ import java.util.Locale
  * call sites as side-effect-free. Log.println is not in that list, so
  * ERROR-priority lines still appear in logcat for release APKs.
  *
- * Also mirrors to a file under the app cache when [file] is set.
+ * Also mirrors to one or more files (prefer external app files dir so
+ * Android/data/<package>/files/logs is visible without root).
  */
-
 object DiagLog {
   @Volatile
-  var file: File? = null
+  private var sinks: List<File> = emptyList()
 
   private val timeFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+  private val lock = Any()
+
+  /** Absolute paths currently receiving log lines. */
+  fun paths(): List<String> = sinks.map { it.absolutePath }
+
+  /**
+   * Configure file sinks. [externalPreferred] is usually
+   * `context.getExternalFilesDir(null)/logs/segmented-debug.log`
+   * (visible under Android/data/<package>/files/logs/).
+   * [internalFallback] is cacheDir for when external storage is unavailable.
+   */
+  @JvmStatic
+  fun configure(vararg files: File?) {
+    sinks = files.filterNotNull().distinctBy { it.absolutePath }
+  }
+
+  /**
+   * Standard dual sink: external files dir (browsable) + internal cache.
+   * Creates parent dirs. Returns the primary (external if possible) path.
+   */
+  @JvmStatic
+  fun setupDefault(context: Context): String {
+    val external = runCatching {
+      context.getExternalFilesDir(null)?.let { root ->
+        File(root, "logs/segmented-debug.log")
+      }
+    }.getOrNull()
+    val internal = File(context.cacheDir, "segmented-http/segmented-debug.log")
+    configure(external, internal)
+    val primary = external ?: internal
+    runCatching { primary.parentFile?.mkdirs() }
+    runCatching { internal.parentFile?.mkdirs() }
+    e(
+      "DiagLog",
+      "log sinks: ${paths().joinToString(" | ")} " +
+        "pkg=${context.packageName}",
+    )
+    return primary.absolutePath
+  }
 
   @JvmStatic
   fun e(tag: String, msg: String, err: Throwable? = null) {
@@ -36,14 +76,22 @@ object DiagLog {
     if (err != null) {
       err.printStackTrace(System.err)
     }
-    val target = file ?: return
-    runCatching {
-      target.parentFile?.mkdirs()
-      val ts = timeFmt.format(Date())
-      FileOutputStream(target, true).bufferedWriter().use { w ->
-        w.append(ts).append(' ').append(tag).append(": ").append(msg).append('\n')
-        if (err != null) {
-          w.append(ts).append(' ').append(Log.getStackTraceString(err)).append('\n')
+    val targets = sinks
+    if (targets.isEmpty()) return
+    val ts = timeFmt.format(Date())
+    val line = buildString {
+      append(ts).append(' ').append(tag).append(": ").append(msg).append('\n')
+      if (err != null) {
+        append(ts).append(' ').append(Log.getStackTraceString(err)).append('\n')
+      }
+    }
+    synchronized(lock) {
+      for (target in targets) {
+        runCatching {
+          target.parentFile?.mkdirs()
+          FileOutputStream(target, true).bufferedWriter().use { w ->
+            w.write(line)
+          }
         }
       }
     }

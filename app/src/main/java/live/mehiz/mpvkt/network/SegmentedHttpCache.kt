@@ -72,8 +72,8 @@ class SegmentedHttpCache(
    * and [OpenResult.usedSegmented] is false.
    */
   fun open(originalUrl: String): OpenResult {
-    // Point file logger at this session's cache dir (release-safe).
-    DiagLog.file = File(cacheDir, "segmented-debug.log")
+    // Do not reset DiagLog sinks here — PlayerActivity already points them at
+    // external Android/data/.../files/logs + internal cache.
     logE("open() url=$originalUrl conn=$connections chunk=$chunkBytes")
     if (!isAcceleratableUrl(originalUrl)) {
       logE("skip: not acceleratable url")
