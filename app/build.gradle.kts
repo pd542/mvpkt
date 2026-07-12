@@ -22,8 +22,8 @@ android {
     minSdk = 21
     targetSdk = 36
     // Bump so devices can verify the log-path fix APK was actually installed.
-    versionCode = 16
-    versionName = "0.1.10-multiformat"
+    versionCode = 17
+    versionName = "0.1.11-seek-priority"
 
     vectorDrawables {
       useSupportLibrary = true

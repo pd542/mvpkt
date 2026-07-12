@@ -515,6 +515,9 @@ class SegmentedHttpCache(
     private val serverExecutor = Executors.newCachedThreadPool()
     private val running = AtomicBoolean(true)
     private val downloaded = AtomicLong(0)
+    /** Playback/seek head — background filler yields to this region first. */
+    private val priorityStart = AtomicLong(-1L)
+    private val priorityEnd = AtomicLong(-1L)
     private var serverSocket: ServerSocket? = null
     val localUrl: String
 
@@ -548,27 +551,39 @@ class SegmentedHttpCache(
     }
 
     /**
-     * Ensure [start, endExclusive) is in the cache, downloading missing holes.
+     * Mark [start, endExclusive) as the live playback window.
+     * Background sequential fill yields so seek can grab all connections.
+     */
+    fun setPlayheadPriority(start: Long, endExclusive: Long) {
+      val s = start.coerceAtLeast(0L)
+      val e = min(endExclusive, config.totalSize).coerceAtLeast(s)
+      priorityStart.set(s)
+      priorityEnd.set(e)
+      log("playhead priority $s-$e")
+    }
+
+    /**
+     * Ensure [start, endExclusive) is cached. Uses **parallel** workers for holes
+     * so seek does not wait on single-thread sequential fill.
      */
     fun ensureRange(start: Long, endExclusive: Long, timeoutMs: Long): Boolean {
       val end = min(endExclusive, config.totalSize)
       if (start >= end) return true
+      setPlayheadPriority(start, end + config.chunkBytes * 4L)
       val deadline = System.currentTimeMillis() + timeoutMs
       var spins = 0
       while (running.get() && System.currentTimeMillis() < deadline) {
         val have = store.contiguousFrom(start)
         if (start + have >= end) return true
         val holeStart = start + have
-        val holeEnd = min(end, holeStart + config.chunkBytes) - 1
-        val before = store.contiguousFrom(holeStart)
-        val ok = downloadRangeBlocking(holeStart, holeEnd)
-        val after = store.contiguousFrom(holeStart)
-        if (!ok && after <= before) {
+        // Parallel-fill a window of holes around the playhead (not one chunk).
+        val windowEnd = min(end, holeStart + config.chunkBytes.toLong() * config.connections)
+        val filled = fillWindowParallel(holeStart, windowEnd, deadline)
+        if (!filled) {
           spins++
           if (spins >= 3) {
             log("ensureRange no progress at $holeStart after $spins tries")
-            // Brief backoff then continue until deadline.
-            runCatching { Thread.sleep(150L * spins) }
+            runCatching { Thread.sleep(80L * spins) }
           }
         } else {
           spins = 0
@@ -582,53 +597,141 @@ class SegmentedHttpCache(
       return success
     }
 
+    /**
+     * Download [from, endExclusive) with up to N parallel Range requests.
+     * @return true if any progress was made or region already covered
+     */
+    private fun fillWindowParallel(from: Long, endExclusive: Long, deadline: Long): Boolean {
+      val end = min(endExclusive, config.totalSize)
+      if (from >= end) return true
+      if (store.isFullyCovered(from, end)) return true
+      val chunk = config.chunkBytes.toLong()
+      val workers = config.connections.coerceIn(2, 16)
+      val jobs = ArrayList<Future<*>>(workers)
+      var pos = from
+      var scheduled = 0
+      while (pos < end && scheduled < workers) {
+        val already = store.contiguousFrom(pos)
+        if (already > 0) {
+          pos += already
+          continue
+        }
+        val rangeEnd = min(end, pos + chunk) - 1
+        if (rangeEnd < pos) break
+        val start = pos
+        val stop = rangeEnd
+        pos = rangeEnd + 1
+        scheduled++
+        jobs += executor.submit {
+          downloadRangeBlocking(start, stop)
+        }
+      }
+      if (jobs.isEmpty()) {
+        // Entire window already contiguous — jump ahead.
+        return store.contiguousFrom(from) > 0 || store.isFullyCovered(from, end)
+      }
+      val waitMs = (deadline - System.currentTimeMillis()).coerceAtLeast(100L)
+      jobs.forEach { f ->
+        runCatching { f.get(waitMs, TimeUnit.MILLISECONDS) }
+      }
+      return store.contiguousFrom(from) > 0 || store.isFullyCovered(from, end)
+    }
+
     fun startBackground(afterOffset: Long) {
       // acceptLoop already started in init.
       if (afterOffset >= config.totalSize) return
-      // Stripe filler: keep multi-conn benefit without scattering holes across the file.
+      // Stripe filler: sequential tip fill, but always yields to seek priority.
       serverExecutor.execute { stripeFillLoop(afterOffset) }
       log("background stripe filler from $afterOffset workers=${config.connections}")
     }
 
     /**
-     * Fill the file from [from] using parallel stripes of [connections] chunks,
-     * waiting for each stripe before advancing — keeps the contiguous tip growing.
+     * Fill remaining file with parallel stripes, but **priority playhead first**.
+     * When user seeks, all capacity goes to that window until covered.
      */
     private fun stripeFillLoop(from: Long) {
       var pos = from
       val stripe = config.connections.coerceIn(2, 16)
       val chunk = config.chunkBytes.toLong()
       while (running.get() && pos < config.totalSize) {
-        // Skip already-contiguous region (tail may already be present).
+        // 1) Serve seek/playhead holes with full parallelism first.
+        val pStart = priorityStart.get()
+        val pEnd = priorityEnd.get()
+        if (pStart >= 0L && pEnd > pStart) {
+          val need = !store.isFullyCovered(pStart, min(pEnd, config.totalSize))
+          if (need) {
+            val deadline = System.currentTimeMillis() + 15_000L
+            fillWindowParallel(pStart, min(pEnd, config.totalSize), deadline)
+            // Keep looping on priority until covered or cancelled.
+            if (!store.isFullyCovered(pStart, min(pEnd, config.totalSize))) {
+              runCatching { Thread.sleep(30) }
+              continue
+            }
+            log("priority window filled $pStart-$pEnd")
+          }
+        }
+
+        // 2) Sequential tip fill (after priority is satisfied).
         val already = store.contiguousFrom(pos)
         if (already > 0) {
           pos += already
           continue
         }
+        // If a new seek priority appeared mid-loop, go back to step 1.
+        val ps2 = priorityStart.get()
+        if (ps2 >= 0L && !store.isFullyCovered(ps2, min(priorityEnd.get(), config.totalSize))) {
+          continue
+        }
+
         val jobs = ArrayList<Future<*>>(stripe)
         var stripePos = pos
         repeat(stripe) {
           if (stripePos >= config.totalSize) return@repeat
+          // Skip into next hole if this slice already present (e.g. tail).
+          val skip = store.contiguousFrom(stripePos)
+          if (skip > 0) {
+            stripePos += skip
+            return@repeat
+          }
           val start = stripePos
           val end = min(config.totalSize, start + chunk) - 1
           stripePos = end + 1
           jobs += executor.submit {
+            // Drop background work if a seek is starving for data.
+            val ps = priorityStart.get()
+            val pe = priorityEnd.get()
+            if (ps >= 0L && pe > ps && !store.isFullyCovered(ps, min(pe, config.totalSize))) {
+              return@submit
+            }
             downloadRangeBlocking(start, end)
           }
         }
-        // Wait for this stripe (interruptible).
+        if (jobs.isEmpty()) {
+          // Advanced past holes (tail already there) — scan next hole.
+          var scan = pos
+          while (scan < config.totalSize && store.contiguousFrom(scan) > 0) {
+            scan += store.contiguousFrom(scan)
+          }
+          if (scan <= pos) {
+            // Completely covered from pos? then done.
+            if (store.contiguousFrom(pos) + pos >= config.totalSize) break
+            runCatching { Thread.sleep(100) }
+          } else {
+            pos = scan
+          }
+          continue
+        }
         jobs.forEach { f ->
           runCatching { f.get(120, TimeUnit.SECONDS) }
         }
         val progressed = store.contiguousFrom(pos)
         if (progressed <= 0) {
-          // Hole failed — force single-thread download of next chunk.
           val end = min(config.totalSize, pos + chunk) - 1
           downloadRangeBlocking(pos, end)
           val again = store.contiguousFrom(pos)
           if (again <= 0) {
             log("stripe stuck at $pos — sleep and retry")
-            runCatching { Thread.sleep(400) }
+            runCatching { Thread.sleep(200) }
           } else {
             pos += again
           }
@@ -768,10 +871,12 @@ class SegmentedHttpCache(
         if (range != null) {
           val (from, to) = range
           val length = to - from + 1
-          // Prefill a small window before headers so demux can start immediately.
-          val prefillEnd = min(to + 1, from + 512 * 1024L)
-          val pre = ensureRange(from, prefillEnd, 45_000L)
-          log("proxy 206 $from-$to prefill=$pre")
+          // Seek priority: prefill several MB ahead with parallel workers.
+          val prefillBytes = maxOf(config.chunkBytes.toLong() * 4L, 4L * 1024L * 1024L)
+          val prefillEnd = min(to + 1, from + prefillBytes)
+          setPlayheadPriority(from, from + prefillBytes * 2)
+          val pre = ensureRange(from, prefillEnd, 60_000L)
+          log("proxy 206 $from-$to prefill=$pre want=$prefillBytes")
           val extra = mapOf(
             "Accept-Ranges" to "bytes",
             "Content-Range" to "bytes $from-$to/${config.totalSize}",
@@ -812,9 +917,13 @@ class SegmentedHttpCache(
         var remaining = length
         var pos = start
         var idleRounds = 0
+        // Keep ~8MB ahead of the read cursor as priority for background workers.
+        val ahead = maxOf(config.chunkBytes.toLong() * 6L, 8L * 1024L * 1024L)
         while (remaining > 0 && running.get()) {
           val want = min(buf.size.toLong(), remaining).toInt()
-          val needEnd = pos + want
+          // Prefetch a larger window than a single buffer so demux never starves.
+          val needEnd = min(pos + maxOf(want.toLong(), config.chunkBytes.toLong()), pos + remaining)
+          setPlayheadPriority(pos, pos + ahead)
           val ok = ensureRange(pos, needEnd, 90_000L)
           val avail = store.contiguousFrom(pos).toInt()
           if (avail <= 0) {
