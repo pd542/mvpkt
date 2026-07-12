@@ -109,11 +109,13 @@ class SegmentedHttpCache(
     val headBytes = min(probe.contentLength, HEAD_BYTES)
     val tailBytes = min(probe.contentLength / 4, TAIL_BYTES).coerceAtLeast(0L)
 
+    val format = guessMediaFormat(probe.finalUrl, mediaUrl)
     val sess = Session(
       config = SessionConfig(
         originUrl = probe.finalUrl,
         totalSize = probe.contentLength,
-        contentType = sanitizeContentType(probe.contentType),
+        contentType = sanitizeContentType(probe.contentType, format),
+        fileExtension = format.extension,
         connections = connCount,
         chunkBytes = chunk,
         userAgent = userAgent,
@@ -410,21 +412,73 @@ class SegmentedHttpCache(
       return total.takeUnless { it == "*" }?.toLongOrNull()
     }
 
-    private fun sanitizeContentType(raw: String?): String {
-      if (raw.isNullOrBlank()) return "video/mp4"
+    data class MediaFormat(
+      val extension: String,
+      val mime: String,
+    )
+
+    /**
+     * Infer container from URL path / Content-Disposition-like filename in query.
+     * Supports progressive files: mp4, mkv, webm, mov, avi, ts, m4v, flv, …
+     */
+    fun guessMediaFormat(vararg urls: String): MediaFormat {
+      val path = urls
+        .asSequence()
+        .map { it.substringBefore('#').substringBefore('?') }
+        .map { it.substringAfterLast('/').lowercase(Locale.US) }
+        .firstOrNull { it.contains('.') }
+        ?: ""
+      // Also scan full URL for .ext before query (OpenList path encodes name).
+      val blob = urls.joinToString(" ").lowercase(Locale.US)
+      fun has(ext: String): Boolean =
+        path.endsWith(".$ext") ||
+          blob.contains(".$ext?") ||
+          blob.contains(".$ext&") ||
+          blob.contains(".$ext%") ||
+          blob.contains("filename%3d") && blob.contains(".$ext") ||
+          blob.contains("filename=") && blob.contains(".$ext")
+
+      return when {
+        has("mkv") || has("mk3d") || has("mka") ->
+          MediaFormat("mkv", "video/x-matroska")
+        has("webm") -> MediaFormat("webm", "video/webm")
+        has("mov") || has("qt") -> MediaFormat("mov", "video/quicktime")
+        has("m4v") -> MediaFormat("m4v", "video/x-m4v")
+        has("m4a") -> MediaFormat("m4a", "audio/mp4")
+        has("mp3") -> MediaFormat("mp3", "audio/mpeg")
+        has("flac") -> MediaFormat("flac", "audio/flac")
+        has("aac") -> MediaFormat("aac", "audio/aac")
+        has("ogg") || has("ogv") || has("opus") ->
+          MediaFormat("ogg", "application/ogg")
+        has("avi") -> MediaFormat("avi", "video/x-msvideo")
+        has("flv") -> MediaFormat("flv", "video/x-flv")
+        has("wmv") || has("asf") -> MediaFormat("wmv", "video/x-ms-wmv")
+        has("ts") || has("m2ts") || has("mts") ->
+          MediaFormat("ts", "video/mp2t")
+        has("mpg") || has("mpeg") -> MediaFormat("mpg", "video/mpeg")
+        has("3gp") || has("3g2") -> MediaFormat("3gp", "video/3gpp")
+        has("wav") -> MediaFormat("wav", "audio/wav")
+        has("mp4") || has("f4v") -> MediaFormat("mp4", "video/mp4")
+        else -> MediaFormat("mp4", "video/mp4") // safe progressive default
+      }
+    }
+
+    private fun sanitizeContentType(raw: String?, format: MediaFormat): String {
+      val fallback = format.mime
+      if (raw.isNullOrBlank()) return fallback
       val clean = raw.substringBefore(';').trim().lowercase(Locale.US)
-      if (clean.isBlank()) return "video/mp4"
-      // CDN often serves progressive mp4 as application/octet-stream — mpv needs video/*.
+      if (clean.isBlank()) return fallback
+      // CDN often serves progressive media as application/octet-stream.
       if (clean == "application/octet-stream" ||
         clean == "binary/octet-stream" ||
         clean == "application/force-download" ||
         clean == "application/download"
       ) {
-        return "video/mp4"
+        return fallback
       }
       if (clean.startsWith("video/") || clean.startsWith("audio/")) return clean
-      // Unknown non-media type — still prefer video/mp4 for progressive files.
-      if (clean.startsWith("text/")) return "video/mp4"
+      // text/html already rejected at probe; other text → use format guess.
+      if (clean.startsWith("text/")) return fallback
       return clean
     }
 
@@ -441,6 +495,8 @@ class SegmentedHttpCache(
     val originUrl: String,
     val totalSize: Long,
     val contentType: String,
+    /** File extension without dot, e.g. mp4 / mkv / webm. */
+    val fileExtension: String,
     val connections: Int,
     val chunkBytes: Int,
     val userAgent: String,
@@ -479,9 +535,10 @@ class SegmentedHttpCache(
       // Bind IPv4 loopback only — mpv gets http://127.0.0.1:port/...
       val ss = ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"))
       serverSocket = ss
-      // .mp4 extension helps libmpv pick the demuxer when Content-Type is vague.
-      localUrl = "http://127.0.0.1:${ss.localPort}/media.mp4"
-      log("proxy listen $localUrl file=${cacheFile.name}")
+      // Extension helps libmpv pick demuxer (mp4/mkv/webm/…, not only mp4).
+      val ext = config.fileExtension.ifBlank { "mp4" }
+      localUrl = "http://127.0.0.1:${ss.localPort}/media.$ext"
+      log("proxy listen $localUrl type=${config.contentType} file=${cacheFile.name}")
       // Accept clients as soon as the socket is up (before head finishes).
       serverExecutor.execute { acceptLoop() }
     }
