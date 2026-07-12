@@ -150,6 +150,7 @@ class SegmentedHttpCache(
         "Chrome/120.0.0.0 Mobile Safari/537.36"
     private const val MIN_CHUNK = 256 * 1024
     private const val MAX_CHUNK = 4 * 1024 * 1024
+
     /** Contiguous head downloaded before playback starts. */
     private const val HEAD_BYTES = 2L * 1024L * 1024L
     private const val MIN_HEAD_TO_START = 256L * 1024L
