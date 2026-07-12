@@ -53,7 +53,6 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
-import androidx.lifecycle.coroutineScope
 import `is`.xyz.mpv.Utils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -68,21 +67,15 @@ import live.mehiz.mpvkt.ui.theme.DarkMode
 import live.mehiz.mpvkt.ui.theme.MpvKtTheme
 import live.mehiz.mpvkt.ui.theme.spacing
 import org.koin.android.ext.android.inject
-import java.io.BufferedReader
 import java.io.File
-import java.io.InputStreamReader
 
 class CrashActivity : ComponentActivity() {
 
   private val clipboardManager by lazy { getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager }
-  private lateinit var logcat: String
   private val appearancePreferences: AppearancePreferences by inject()
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
-    lifecycle.coroutineScope.launch {
-      logcat = collectLogcat()
-    }
     setContent {
       val dark by appearancePreferences.darkMode.collectAsState()
       val isSystemInDarkTheme = isSystemInDarkTheme()
@@ -102,14 +95,13 @@ class CrashActivity : ComponentActivity() {
     suspend fun shareLogs(
       deviceInfo: String,
       exceptionString: String? = null,
-      logcat: String,
       activity: Activity,
     ) {
       withContext(NonCancellable) {
         val file = File(activity.cacheDir, "mpvKt_logs.txt")
         if (file.exists()) file.delete()
         file.createNewFile()
-        file.appendText(concatLogs(deviceInfo, exceptionString, logcat))
+        file.appendText(concatLogs(deviceInfo, exceptionString))
         val uri = FileProvider.getUriForFile(activity, BuildConfig.APPLICATION_ID + ".provider", file)
         val intent = Intent(Intent.ACTION_SEND)
         intent.putExtra(Intent.EXTRA_STREAM, uri)
@@ -125,7 +117,6 @@ class CrashActivity : ComponentActivity() {
     fun concatLogs(
       deviceInfo: String,
       crashLogs: String? = null,
-      logcat: String,
     ): String {
       return StringBuilder().apply {
         appendLine(deviceInfo)
@@ -135,22 +126,7 @@ class CrashActivity : ComponentActivity() {
           appendLine(crashLogs)
           appendLine()
         }
-        appendLine("Logcat:")
-        appendLine(logcat)
       }.toString()
-    }
-
-    fun collectLogcat(): String {
-      val process = Runtime.getRuntime()
-      val reader = BufferedReader(InputStreamReader(process.exec("logcat -d").inputStream))
-      val logcat = StringBuilder()
-      // reader.lines() looks much nicer so why not use it on devices that support it?
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-        reader.lines().forEach(logcat::appendLine)
-      } else {
-        reader.readLines().forEach(logcat::appendLine)
-      }
-      return logcat.toString()
     }
 
     fun collectDeviceInfo(): String {
@@ -197,7 +173,7 @@ class CrashActivity : ComponentActivity() {
             Button(
               onClick = {
                 scope.launch(Dispatchers.IO) {
-                  shareLogs(collectDeviceInfo(), exceptionString, logcat, this@CrashActivity)
+                  shareLogs(collectDeviceInfo(), exceptionString, this@CrashActivity)
                 }
               },
               modifier = Modifier.weight(1f),
@@ -207,7 +183,7 @@ class CrashActivity : ComponentActivity() {
                 clipboardManager.setPrimaryClip(
                   ClipData.newPlainText(
                     null,
-                    concatLogs(collectDeviceInfo(), exceptionString, logcat),
+                    concatLogs(collectDeviceInfo(), exceptionString),
                   ),
                 )
               },
@@ -254,11 +230,6 @@ class CrashActivity : ComponentActivity() {
           style = MaterialTheme.typography.headlineSmall,
         )
         LogsContainer(exceptionString)
-        Text(
-          "Logcat:",
-          style = MaterialTheme.typography.headlineSmall,
-        )
-        LogsContainer(logcat)
         Spacer(Modifier.height(8.dp))
       }
     }

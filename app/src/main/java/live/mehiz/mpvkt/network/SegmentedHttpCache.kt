@@ -72,35 +72,22 @@ class SegmentedHttpCache(
    * and [OpenResult.usedSegmented] is false.
    */
   fun open(originalUrl: String): OpenResult {
-    // Do not reset DiagLog sinks here — PlayerActivity already points them at
-    // external Android/data/.../files/logs + internal cache.
-    logE("open() url=$originalUrl conn=$connections chunk=$chunkBytes")
     return runCatching {
       val direct = resolveDirectMediaUrl(originalUrl, userAgent)
-      if (direct != originalUrl) {
-        logE("resolved openlist/redirect → $direct")
-      }
       if (!isAcceleratableUrl(direct)) {
-        logE("skip: not acceleratable after resolve")
         // Prefer resolved direct URL for mpv even when not multi-conn.
         return@runCatching OpenResult(direct, false)
       }
       startSession(direct)
-    }.getOrElse { e ->
-      logE("segmented open failed → direct: ${e.message}", e)
-      shutdownQuietly()
+    }.getOrElse {
+      shutdownQuietly(deleteCache = true)
       OpenResult(originalUrl, false)
     }
   }
 
   private fun startSession(mediaUrl: String): OpenResult {
     val probe = probe(mediaUrl, userAgent)
-    logE(
-      "probe range=${probe.supportsRange} len=${probe.contentLength} " +
-        "type=${probe.contentType} final=${probe.finalUrl}",
-    )
     if (!probe.supportsRange || probe.contentLength < MIN_FILE_FOR_ACCEL) {
-      logE("skip segmented range=${probe.supportsRange} len=${probe.contentLength}")
       return OpenResult(mediaUrl, false)
     }
 
@@ -121,51 +108,39 @@ class SegmentedHttpCache(
         userAgent = userAgent,
       ),
       cacheDir = cacheDir,
-      log = { msg -> logE(msg) },
+      log = {},
     )
 
     // Contiguous head before play — required for demux.
     val headOk = sess.downloadRangeBlocking(0L, headBytes - 1)
     val have = sess.store.contiguousFrom(0L)
-    logE("head download ok=$headOk have=$have need=$headBytes")
     if (!headOk || have < min(headBytes, MIN_HEAD_TO_START)) {
-      logE("head incomplete have=$have need=$headBytes → direct")
-      sess.close()
+      sess.close(deleteCache = true)
       return OpenResult(mediaUrl, false)
     }
 
     // Tail for moov-at-end progressive mp4/mkv (common on CDN progressive files).
     if (tailBytes > 0 && probe.contentLength > headBytes + tailBytes) {
       val tailStart = probe.contentLength - tailBytes
-      val tailOk = sess.downloadRangeBlocking(tailStart, probe.contentLength - 1)
-      logE("tail download ok=$tailOk start=$tailStart size=$tailBytes")
+      sess.downloadRangeBlocking(tailStart, probe.contentLength - 1)
     }
 
     sess.startBackground(afterOffset = have)
     session = sess
 
-    logE(
-      "segmented OK head=$have total=${probe.contentLength} " +
-        "workers=$connCount → ${sess.localUrl}",
-    )
     return OpenResult(sess.localUrl, true)
   }
 
-  fun close() = shutdownQuietly()
+  fun close() = shutdownQuietly(deleteCache = false)
 
-  private fun shutdownQuietly() {
-    session?.close()
+  fun deleteCache() = shutdownQuietly(deleteCache = true)
+
+  private fun shutdownQuietly(deleteCache: Boolean) {
+    session?.close(deleteCache)
     session = null
-    logE("shutdown")
-  }
-
-  /** Release-safe logger ([DiagLog] uses Log.println so R8 won't strip it). */
-  private fun logE(msg: String, err: Throwable? = null) {
-    DiagLog.e(TAG, msg, err)
   }
 
   companion object {
-    private const val TAG = "SegmentedHttpCache"
     private const val DEFAULT_UA =
       "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) " +
         "Chrome/120.0.0.0 Mobile Safari/537.36"
@@ -196,7 +171,6 @@ class SegmentedHttpCache(
       // OpenList/Alist intermediate /d/?sign= links are NOT final media — resolve first.
       // Real CDN signed URLs (X-Amz-*) ARE acceleratable after resolve.
       if (isOpenListIntermediate(lower)) {
-        DiagLog.e(TAG, "skip acceleratable: openlist intermediate (resolve first)")
         return false
       }
       return true
@@ -263,10 +237,6 @@ class SegmentedHttpCache(
             val loc = head.getHeaderField("Location")
             val type = head.contentType
             val len = head.getHeaderFieldLong("Content-Length", -1L)
-            DiagLog.e(
-              TAG,
-              "resolve HEAD hop=$hops code=$code type=$type len=$len loc=${loc ?: "-"}",
-            )
             if (code in 300..399 && !loc.isNullOrBlank()) {
               head.disconnect()
               current = URL(URL(current), loc).toString()
@@ -282,7 +252,6 @@ class SegmentedHttpCache(
             head.disconnect()
           } catch (e: Exception) {
             runCatching { head.disconnect() }
-            DiagLog.e(TAG, "resolve HEAD hop=$hops fail: ${e.message}")
           }
 
           // Some OpenList builds do not support HEAD — one full GET without Range,
@@ -299,10 +268,6 @@ class SegmentedHttpCache(
             val loc = get.getHeaderField("Location")
             val type = get.contentType
             val len = get.getHeaderFieldLong("Content-Length", -1L)
-            DiagLog.e(
-              TAG,
-              "resolve GET hop=$hops code=$code type=$type len=$len loc=${loc ?: "-"}",
-            )
             if (code in 300..399 && !loc.isNullOrBlank()) {
               runCatching { get.inputStream.close() }
               get.disconnect()
@@ -322,13 +287,11 @@ class SegmentedHttpCache(
             get.disconnect()
           } catch (e: Exception) {
             runCatching { get.disconnect() }
-            DiagLog.e(TAG, "resolve GET hop=$hops fail: ${e.message}")
           }
           break
         }
         current
       } catch (e: Exception) {
-        DiagLog.e(TAG, "resolveDirect failed: ${e.message}", e)
         url
       }
     }
@@ -344,10 +307,6 @@ class SegmentedHttpCache(
       val get = probeOnce(url, userAgent, useHead = false)
       if (isHtmlType(get.contentType) || get.contentLength in 1 until 8 * 1024) {
         // HTML error page or tiny payload — not a progressive video.
-        DiagLog.e(
-          TAG,
-          "probe rejects non-media type=${get.contentType} len=${get.contentLength}",
-        )
         return ProbeResult(false, get.contentLength, get.contentType, get.finalUrl)
       }
       return get
@@ -398,7 +357,6 @@ class SegmentedHttpCache(
           }
         }
       } catch (e: Exception) {
-        DiagLog.e(TAG, "probe error head=$useHead: ${e.message}", e)
         runCatching { conn.disconnect() }
         ProbeResult(false, -1L, null, url)
       }
@@ -954,13 +912,13 @@ class SegmentedHttpCache(
       }
     }
 
-    fun close() {
+    fun close(deleteCache: Boolean = false) {
       running.set(false)
       executor.shutdownNow()
       serverExecutor.shutdownNow()
       runCatching { serverSocket?.close() }
       runCatching { raf.close() }
-      log("closed downloaded=${downloaded.get()}/${config.totalSize}")
+      if (deleteCache) runCatching { cacheFile.delete() }
     }
 
     private data class HttpRequest(

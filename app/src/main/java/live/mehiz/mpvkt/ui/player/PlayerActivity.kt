@@ -53,7 +53,6 @@ import live.mehiz.mpvkt.database.entities.CustomButtonEntity
 import live.mehiz.mpvkt.database.entities.PlaybackStateEntity
 import live.mehiz.mpvkt.databinding.PlayerLayoutBinding
 import live.mehiz.mpvkt.domain.playbackstate.repository.PlaybackStateRepository
-import live.mehiz.mpvkt.network.DiagLog
 import live.mehiz.mpvkt.network.SegmentedHttpCache
 import live.mehiz.mpvkt.preferences.AdvancedPreferences
 import live.mehiz.mpvkt.preferences.AudioPreferences
@@ -155,26 +154,12 @@ class PlayerActivity : AppCompatActivity() {
   }
 
   private fun startPlayback(intent: Intent, useLoadfileCommand: Boolean) {
-    // External: Android/data/<package>/files/logs/segmented-debug.log (no root needed)
-    // Internal fallback: cacheDir/segmented-http/segmented-debug.log
-    val logPath = DiagLog.setupDefault(this)
-    DiagLog.e(TAG, "playback start; file log=$logPath")
-    val source = resolvePlayableUri(intent)
-    if (source == null) {
-      DiagLog.e(TAG, "No playable URI in intent")
-      return
-    }
-    DiagLog.e(
-      TAG,
-      "startPlayback source=$source multi=${networkPreferences.multiConnectionDownload.get()}",
-    )
-
+    val source = resolvePlayableUri(intent) ?: return
     val wantSegmented = networkPreferences.multiConnectionDownload.get() &&
       SegmentedHttpCache.shouldTryAccelerate(source)
 
     if (!wantSegmented) {
       // Direct play — same as upstream mpvKt.
-      DiagLog.e(TAG, "direct play (segmented off or non-http): $source")
       playUri(source, useLoadfileCommand)
       return
     }
@@ -183,20 +168,15 @@ class PlayerActivity : AppCompatActivity() {
     // On failure, open() already returns the original URL.
     lifecycleScope.launch {
       val playable = withContext(Dispatchers.IO) {
-        runCatching { maybeAccelerateHttp(source) }
-          .onFailure { DiagLog.e(TAG, "maybeAccelerateHttp failed: ${it.message}", it) }
-          .getOrDefault(source)
+        runCatching { maybeAccelerateHttp(source) }.getOrDefault(source)
       }
-      DiagLog.e(TAG, "playable path=$playable (source=$source)")
       playUri(playable, useLoadfileCommand)
     }
   }
 
   private fun playUri(uri: String, useLoadfileCommand: Boolean) {
-    // DiagLog uses Log.println — not stripped by R8 optimize.
     val isLocalProxy = uri.startsWith("http://127.0.0.1:") ||
       uri.startsWith("http://localhost:")
-    DiagLog.e(TAG, "Loading media: $uri loadfile=$useLoadfileCommand proxy=$isLocalProxy")
     // Local multi-conn proxy: always use loadfile so libmpv opens as network stream.
     if (useLoadfileCommand || isLocalProxy) {
       if (isLocalProxy) {
@@ -225,20 +205,13 @@ class PlayerActivity : AppCompatActivity() {
    * otherwise the original remote URL.
    */
   private fun maybeAccelerateHttp(uri: String): String {
-    if (!SegmentedHttpCache.shouldTryAccelerate(uri)) {
-      DiagLog.e(TAG, "not try-accelerate: $uri")
-      return uri
-    }
+    if (!SegmentedHttpCache.shouldTryAccelerate(uri)) return uri
 
-    segmentedHttpCache?.close()
-    segmentedHttpCache = null
+    clearSegmentedPlaybackCache()
 
     val connections = networkPreferences.multiConnectionCount.get().coerceIn(2, 16)
     val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 4096)
     val cacheRoot = File(cacheDir, "segmented-http").also { it.mkdirs() }
-    // Keep dual sinks (external + internal); do not overwrite with internal-only path.
-    DiagLog.setupDefault(this)
-    DiagLog.e(TAG, "accelerate start conn=$connections chunkKb=$chunkKb cache=$cacheRoot")
     val accelerator = SegmentedHttpCache(
       cacheDir = cacheRoot,
       connections = connections,
@@ -247,16 +220,16 @@ class PlayerActivity : AppCompatActivity() {
     val result = accelerator.open(uri)
     return if (result.usedSegmented) {
       segmentedHttpCache = accelerator
-      DiagLog.e(
-        TAG,
-        "Segmented ON: $uri → ${result.playPath} ($connections x ${chunkKb}KiB)",
-      )
       result.playPath
     } else {
-      accelerator.close()
-      DiagLog.e(TAG, "Segmented pass-through (direct): $uri")
+      accelerator.deleteCache()
       uri
     }
+  }
+
+  private fun clearSegmentedPlaybackCache() {
+    segmentedHttpCache?.deleteCache()
+    segmentedHttpCache = null
   }
 
   override fun onDestroy() {
@@ -278,8 +251,7 @@ class PlayerActivity : AppCompatActivity() {
     }
     MPVLib.removeObserver(playerObserver)
     MPVLib.destroy()
-    segmentedHttpCache?.close()
-    segmentedHttpCache = null
+    clearSegmentedPlaybackCache()
 
     super.onDestroy()
   }
@@ -651,7 +623,10 @@ class PlayerActivity : AppCompatActivity() {
     when (property) {
       "pause" if value -> window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
       "pause" -> window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-      "eof-reached" if value && playerPreferences.closeAfterReachingEndOfVideo.get() -> finishAndRemoveTask()
+      "eof-reached" if value -> {
+        clearSegmentedPlaybackCache()
+        if (playerPreferences.closeAfterReachingEndOfVideo.get()) finishAndRemoveTask()
+      }
     }
   }
 
@@ -779,9 +754,8 @@ class PlayerActivity : AppCompatActivity() {
   override fun onNewIntent(intent: Intent) {
     super.onNewIntent(intent)
     setIntent(intent)
-    // Close previous multi-conn session before opening a new URL.
-    segmentedHttpCache?.close()
-    segmentedHttpCache = null
+    // Clear previous multi-conn session before opening a new URL.
+    clearSegmentedPlaybackCache()
     startPlayback(intent, useLoadfileCommand = true)
   }
 
