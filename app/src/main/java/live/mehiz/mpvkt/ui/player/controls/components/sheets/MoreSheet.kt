@@ -62,6 +62,7 @@ import live.mehiz.mpvkt.preferences.AudioPreferences
 import live.mehiz.mpvkt.preferences.PlayerPreferences
 import live.mehiz.mpvkt.preferences.preference.collectAsState
 import live.mehiz.mpvkt.presentation.components.PlayerSheet
+import live.mehiz.mpvkt.ui.player.applyAudioChannels
 import live.mehiz.mpvkt.ui.player.execute
 import live.mehiz.mpvkt.ui.player.executeLongClick
 import live.mehiz.mpvkt.ui.theme.spacing
@@ -219,12 +220,7 @@ fun MoreSheet(
             selected = audioChannels == it,
             onClick = {
               audioPreferences.audioChannels.set(it)
-              if (it == AudioChannels.ReverseStereo) {
-                MPVLib.setPropertyString(AudioChannels.AutoSafe.property, AudioChannels.AutoSafe.value)
-              } else {
-                MPVLib.setPropertyString(AudioChannels.ReverseStereo.property, "")
-              }
-              MPVLib.setPropertyString(it.property, it.value)
+              applyAudioChannels(it)
             },
             label = { Text(text = stringResource(id = it.title)) },
           )

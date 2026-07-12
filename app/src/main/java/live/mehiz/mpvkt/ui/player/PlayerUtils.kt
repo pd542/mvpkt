@@ -4,9 +4,11 @@ import android.content.Context
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.util.Log
+import `is`.xyz.mpv.MPVLib
 import `is`.xyz.mpv.MPVNode
 import `is`.xyz.mpv.Utils
 import kotlinx.serialization.json.Json
+import live.mehiz.mpvkt.preferences.AudioChannels
 
 internal fun Uri.openContentFd(context: Context): String? {
   return context.contentResolver.openFileDescriptor(this, "r")?.detachFd()?.let {
@@ -27,6 +29,15 @@ internal fun Uri.resolveUri(context: Context): String? {
 
   if (filepath == null) Log.e(TAG, "unknown scheme: $scheme")
   return filepath
+}
+
+internal fun applyAudioChannels(audioChannels: AudioChannels) {
+  if (audioChannels == AudioChannels.ReverseStereo) {
+    MPVLib.setPropertyString(AudioChannels.AutoSafe.property, AudioChannels.AutoSafe.value)
+  } else {
+    MPVLib.setPropertyString(AudioChannels.ReverseStereo.property, "")
+  }
+  MPVLib.setPropertyString(audioChannels.property, audioChannels.value)
 }
 
 internal val videoExtensions = listOf(

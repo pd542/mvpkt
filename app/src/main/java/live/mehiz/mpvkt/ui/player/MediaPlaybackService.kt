@@ -60,22 +60,21 @@ class MediaPlaybackService : MediaBrowserServiceCompat(), MPVLib.EventObserver {
   private lateinit var audioManager: AudioManager
   private var audioFocusRequest: AudioFocusRequest? = null
   private var audioFocusCallback: AudioManager.OnAudioFocusChangeListener? = null
-
-  init {
-    MPVLib.addObserver(this)
-  }
+  private var isDestroyed = false
 
   @Suppress("EmptyFunctionBlock")
   override fun eventProperty(property: String) {
   }
 
   override fun eventProperty(property: String, value: Long) {
+    if (isDestroyed) return
     when (property) {
       "duration", "time-pos" -> updatePlaybackState()
     }
   }
 
   override fun eventProperty(property: String, value: Boolean) {
+    if (isDestroyed) return
     when (property) {
       "pause" -> {
         updatePlaybackState()
@@ -85,6 +84,7 @@ class MediaPlaybackService : MediaBrowserServiceCompat(), MPVLib.EventObserver {
   }
 
   override fun eventProperty(property: String, value: String) {
+    if (isDestroyed) return
     when (property) {
       "metadata/artist" -> {
         mediaArtist = value
@@ -431,11 +431,13 @@ class MediaPlaybackService : MediaBrowserServiceCompat(), MPVLib.EventObserver {
   }
 
   private fun updateNotification() {
+    if (isDestroyed) return
     val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
     notificationManager.notify(NOTIFICATION_ID, createNotification())
   }
 
   override fun onDestroy() {
+    isDestroyed = true
     try {
       MPVLib.removeObserver(this)
       mediaSession.release()

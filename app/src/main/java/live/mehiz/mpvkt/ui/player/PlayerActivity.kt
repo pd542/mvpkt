@@ -95,6 +95,19 @@ class PlayerActivity : AppCompatActivity() {
   private var audioFocusRequest: AudioFocusRequestCompat? = null
   private var restoreAudioFocus: () -> Unit = {}
 
+  private data class PlaybackStateSnapshot(
+    val pos: Int,
+    val duration: Int,
+    val playbackSpeed: Double,
+    val sid: Int,
+    val subDelay: Int,
+    val subSpeed: Double,
+    val secondarySid: Int,
+    val secondarySubDelay: Int,
+    val aid: Int,
+    val audioDelay: Int,
+  )
+
   private var pipRect: android.graphics.Rect? = null
   val isPipSupported by lazy {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
@@ -257,6 +270,7 @@ class PlayerActivity : AppCompatActivity() {
       unregisterReceiver(noisyReceiver)
       noisyReceiver.initialized = false
     }
+    endBackgroundPlayback()
 
     player.isExiting = true
     if (isFinishing) {
@@ -288,7 +302,7 @@ class PlayerActivity : AppCompatActivity() {
 
   override fun onStop() {
     saveVideoPlaybackState(fileName)
-    if (!serviceBound && playerPreferences.automaticBackgroundPlayback.get()) {
+    if (!isFinishing && !serviceBound && playerPreferences.automaticBackgroundPlayback.get()) {
       startBackgroundPlayback()
     } else {
       viewModel.pause()
@@ -377,7 +391,7 @@ class PlayerActivity : AppCompatActivity() {
   }
 
   private fun setupAudio() {
-    audioPreferences.audioChannels.get().let { MPVLib.setPropertyString(it.property, it.value) }
+    applyAudioChannels(audioPreferences.audioChannels.get())
 
     val request = AudioFocusRequestCompat.Builder(AudioManagerCompat.AUDIOFOCUS_GAIN).also {
       it.setAudioAttributes(
@@ -542,9 +556,12 @@ class PlayerActivity : AppCompatActivity() {
   }
 
   private fun endBackgroundPlayback() {
+    if (serviceBound) {
+      unbindService(serviceConnection)
+      serviceBound = false
+    }
     stopService(Intent(this, MediaPlaybackService::class.java))
     mediaPlaybackService = null
-    serviceBound = false
   }
 
   private fun setIntentExtras(extras: Bundle?) {
@@ -681,7 +698,25 @@ class PlayerActivity : AppCompatActivity() {
   }
 
   private fun saveVideoPlaybackState(mediaTitle: String) {
-    if (mediaTitle.isBlank()) return
+    if (mediaTitle.isBlank() || player.isExiting) return
+    val snapshot = runCatching {
+      PlaybackStateSnapshot(
+        pos = viewModel.pos ?: 0,
+        duration = viewModel.duration ?: 0,
+        playbackSpeed = MPVLib.getPropertyDouble("speed") ?: 1.0,
+        sid = player.sid,
+        subDelay = ((MPVLib.getPropertyDouble("sub-delay") ?: 0.0) * 1000).toInt(),
+        subSpeed = MPVLib.getPropertyDouble("sub-speed") ?: subtitlesPreferences.defaultSubSpeed.get().toDouble(),
+        secondarySid = player.secondarySid,
+        secondarySubDelay = ((MPVLib.getPropertyDouble("secondary-sub-delay") ?: 0.0) * 1000).toInt(),
+        aid = player.aid,
+        audioDelay = ((MPVLib.getPropertyDouble("audio-delay") ?: 0.0) * 1000).toInt(),
+      )
+    }.getOrElse { error ->
+      Log.e(TAG, "Couldn't read playback state: ${error.message}")
+      return
+    }
+
     lifecycleScope.launch(Dispatchers.IO) {
       val oldState = playbackStateRepository.getVideoDataByTitle(fileName)
       Log.d(TAG, "Saving playback state")
@@ -689,20 +724,18 @@ class PlayerActivity : AppCompatActivity() {
         PlaybackStateEntity(
           mediaTitle = mediaTitle,
           lastPosition = if (playerPreferences.savePositionOnQuit.get()) {
-            val pos = viewModel.pos ?: 0
-            val duration = viewModel.duration ?: 0
-            if (pos < duration - 1) pos else 0
+            if (snapshot.pos < snapshot.duration - 1) snapshot.pos else 0
           } else {
             oldState?.lastPosition ?: 0
           },
-          playbackSpeed = MPVLib.getPropertyDouble("speed")!!,
-          sid = player.sid,
-          subDelay = (MPVLib.getPropertyDouble("sub-delay")!! * 1000).toInt(),
-          subSpeed = MPVLib.getPropertyDouble("sub-speed")!!,
-          secondarySid = player.secondarySid,
-          secondarySubDelay = (MPVLib.getPropertyDouble("secondary-sub-delay")!! * 1000).toInt(),
-          aid = player.aid,
-          audioDelay = (MPVLib.getPropertyDouble("audio-delay")!! * 1000).toInt(),
+          playbackSpeed = snapshot.playbackSpeed,
+          sid = snapshot.sid,
+          subDelay = snapshot.subDelay,
+          subSpeed = snapshot.subSpeed,
+          secondarySid = snapshot.secondarySid,
+          secondarySubDelay = snapshot.secondarySubDelay,
+          aid = snapshot.aid,
+          audioDelay = snapshot.audioDelay,
         ),
       )
     }
@@ -722,8 +755,8 @@ class PlayerActivity : AppCompatActivity() {
       player.secondarySid = it.secondarySid
       player.aid = it.aid
       MPVLib.setPropertyDouble("sub-delay", subDelay)
-      MPVLib.setPropertyDouble("sub-delay", secondarySubDelay)
-      MPVLib.setPropertyDouble("sub-delay", it.playbackSpeed)
+      MPVLib.setPropertyDouble("secondary-sub-delay", secondarySubDelay)
+      MPVLib.setPropertyDouble("speed", it.playbackSpeed)
       MPVLib.setPropertyDouble("audio-delay", audioDelay)
     }
     if (playerPreferences.savePositionOnQuit.get()) {
