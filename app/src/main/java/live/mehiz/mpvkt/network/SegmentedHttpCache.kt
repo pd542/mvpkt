@@ -75,26 +75,33 @@ class SegmentedHttpCache(
     // Do not reset DiagLog sinks here — PlayerActivity already points them at
     // external Android/data/.../files/logs + internal cache.
     logE("open() url=$originalUrl conn=$connections chunk=$chunkBytes")
-    if (!isAcceleratableUrl(originalUrl)) {
-      logE("skip: not acceleratable url")
-      return OpenResult(originalUrl, false)
-    }
-    return runCatching { startSession(originalUrl) }.getOrElse { e ->
+    return runCatching {
+      val direct = resolveDirectMediaUrl(originalUrl, userAgent)
+      if (direct != originalUrl) {
+        logE("resolved openlist/redirect → $direct")
+      }
+      if (!isAcceleratableUrl(direct)) {
+        logE("skip: not acceleratable after resolve")
+        // Prefer resolved direct URL for mpv even when not multi-conn.
+        return@runCatching OpenResult(direct, false)
+      }
+      startSession(direct)
+    }.getOrElse { e ->
       logE("segmented open failed → direct: ${e.message}", e)
       shutdownQuietly()
       OpenResult(originalUrl, false)
     }
   }
 
-  private fun startSession(originalUrl: String): OpenResult {
-    val probe = probe(originalUrl, userAgent)
+  private fun startSession(mediaUrl: String): OpenResult {
+    val probe = probe(mediaUrl, userAgent)
     logE(
       "probe range=${probe.supportsRange} len=${probe.contentLength} " +
         "type=${probe.contentType} final=${probe.finalUrl}",
     )
     if (!probe.supportsRange || probe.contentLength < MIN_FILE_FOR_ACCEL) {
       logE("skip segmented range=${probe.supportsRange} len=${probe.contentLength}")
-      return OpenResult(originalUrl, false)
+      return OpenResult(mediaUrl, false)
     }
 
     val connCount = connections.coerceIn(2, 16)
@@ -122,7 +129,7 @@ class SegmentedHttpCache(
     if (!headOk || have < min(headBytes, MIN_HEAD_TO_START)) {
       logE("head incomplete have=$have need=$headBytes → direct")
       sess.close()
-      return OpenResult(originalUrl, false)
+      return OpenResult(mediaUrl, false)
     }
 
     // Tail for moov-at-end progressive mp4/mkv (common on CDN progressive files).
@@ -184,40 +191,144 @@ class SegmentedHttpCache(
         lower.contains("/hls/") ||
         lower.contains("playlist")
       if (adaptive) return false
-      // Signed / one-shot download links (Alist/OpenList, S3, CDN).
-      // A Range probe can burn the token so even "fallback direct" then fails.
-      if (looksSignedOrOneShot(lower)) {
-        DiagLog.e(TAG, "skip acceleratable: signed/one-shot url")
+      // OpenList/Alist intermediate /d/?sign= links are NOT final media — resolve first.
+      // Real CDN signed URLs (X-Amz-*) ARE acceleratable after resolve.
+      if (isOpenListIntermediate(lower)) {
+        DiagLog.e(TAG, "skip acceleratable: openlist intermediate (resolve first)")
         return false
       }
       return true
     }
 
     /**
-     * True for URLs whose query/path looks like a short-lived download signature.
-     * Multi-connection must never touch these before playback — a failed Range
-     * probe can invalidate the token (Alist/OpenList `?sign=`, S3, OSS, …).
+     * Whether the multi-conn path should run at all (may only resolve OpenList then
+     * fall back to direct, or start segmented on the final CDN URL).
      */
-    fun looksSignedOrOneShot(urlLower: String): Boolean {
-      val strong = arrayOf(
-        "sign=",
-        "signature=",
-        "x-amz-signature=",
-        "x-amz-credential=",
-        "x-oss-signature=",
-        "auth_key=",
-        "authkey=",
-        "access_token=",
-        "wssecret=",
-        "wstime=",
-        "usig=",
-      )
-      if (strong.any { urlLower.contains(it) }) return true
-      // Local file managers (Alist/OpenList on LAN) often serve /d/ with one-shot auth.
-      if (urlLower.contains("localhost") || urlLower.contains("127.0.0.1")) {
-        if (urlLower.contains("/d/") || urlLower.contains("token=")) return true
-      }
+    fun shouldTryAccelerate(url: String): Boolean {
+      val lower = url.lowercase(Locale.US)
+      if (!lower.startsWith("http://") && !lower.startsWith("https://")) return false
+      val adaptive = lower.contains(".m3u8") ||
+        lower.contains(".mpd") ||
+        lower.contains("format=m3u") ||
+        lower.contains("type=m3u8") ||
+        lower.contains("/hls/") ||
+        lower.contains("playlist")
+      return !adaptive
+    }
+
+    /** Alist/OpenList proxy download path that is not the real CDN object. */
+    fun isOpenListIntermediate(urlLower: String): Boolean {
+      val hasSign = urlLower.contains("sign=")
+      val hasDPath = urlLower.contains("/d/")
+      val local = urlLower.contains("localhost") ||
+        urlLower.contains("127.0.0.1") ||
+        urlLower.contains("0.0.0.0")
+      // Classic: http://host:5244/d/path/file.mp4?sign=...
+      if (hasDPath && hasSign) return true
+      if (local && hasDPath) return true
       return false
+    }
+
+    /**
+     * Follow redirects / OpenList gate to the real media CDN URL.
+     * Does not use Range on the first hop so one-shot OpenList signs stay valid.
+     */
+    fun resolveDirectMediaUrl(url: String, userAgent: String = DEFAULT_UA): String {
+      val lower = url.lowercase(Locale.US)
+      if (!lower.startsWith("http://") && !lower.startsWith("https://")) return url
+      // Real object-store signed URLs are already final.
+      if (lower.contains("x-amz-signature=") || lower.contains("x-oss-signature=")) {
+        return url
+      }
+      if (!isOpenListIntermediate(lower) && !lower.contains("sign=")) {
+        return url
+      }
+      return try {
+        var current = url
+        var hops = 0
+        while (hops < 8) {
+          hops++
+          // HEAD first — no body, safe for one-shot OpenList signs.
+          val head = openConnection(current, userAgent).apply {
+            requestMethod = "HEAD"
+            instanceFollowRedirects = false
+            connectTimeout = CONNECT_TIMEOUT_MS
+            readTimeout = READ_TIMEOUT_MS
+          }
+          try {
+            head.connect()
+            val code = head.responseCode
+            val loc = head.getHeaderField("Location")
+            val type = head.contentType
+            val len = head.getHeaderFieldLong("Content-Length", -1L)
+            DiagLog.e(
+              TAG,
+              "resolve HEAD hop=$hops code=$code type=$type len=$len loc=${loc ?: "-"}",
+            )
+            if (code in 300..399 && !loc.isNullOrBlank()) {
+              head.disconnect()
+              current = URL(URL(current), loc).toString()
+              continue
+            }
+            if (code == HttpURLConnection.HTTP_OK || code == HttpURLConnection.HTTP_PARTIAL) {
+              if (!isHtmlType(type) && (len < 0 || len >= MIN_FILE_FOR_ACCEL)) {
+                val finalUrl = head.url.toString()
+                head.disconnect()
+                return finalUrl
+              }
+            }
+            head.disconnect()
+          } catch (e: Exception) {
+            runCatching { head.disconnect() }
+            DiagLog.e(TAG, "resolve HEAD hop=$hops fail: ${e.message}")
+          }
+
+          // Some OpenList builds do not support HEAD — one full GET without Range,
+          // but disconnect immediately after headers if redirected / large.
+          val get = openConnection(current, userAgent).apply {
+            requestMethod = "GET"
+            instanceFollowRedirects = false
+            connectTimeout = CONNECT_TIMEOUT_MS
+            readTimeout = READ_TIMEOUT_MS
+          }
+          try {
+            get.connect()
+            val code = get.responseCode
+            val loc = get.getHeaderField("Location")
+            val type = get.contentType
+            val len = get.getHeaderFieldLong("Content-Length", -1L)
+            DiagLog.e(
+              TAG,
+              "resolve GET hop=$hops code=$code type=$type len=$len loc=${loc ?: "-"}",
+            )
+            if (code in 300..399 && !loc.isNullOrBlank()) {
+              runCatching { get.inputStream.close() }
+              get.disconnect()
+              current = URL(URL(current), loc).toString()
+              continue
+            }
+            if (code == HttpURLConnection.HTTP_OK || code == HttpURLConnection.HTTP_PARTIAL) {
+              if (!isHtmlType(type) && (len < 0 || len >= MIN_FILE_FOR_ACCEL)) {
+                // Do NOT read the body — just take the URL as media origin.
+                runCatching { get.inputStream.close() }
+                val finalUrl = get.url.toString()
+                get.disconnect()
+                return finalUrl
+              }
+            }
+            runCatching { get.inputStream.close() }
+            get.disconnect()
+          } catch (e: Exception) {
+            runCatching { get.disconnect() }
+            DiagLog.e(TAG, "resolve GET hop=$hops fail: ${e.message}")
+          }
+          break
+        }
+        current
+      } catch (e: Exception) {
+        DiagLog.e(TAG, "resolveDirect failed: ${e.message}", e)
+        url
+      }
     }
 
     fun probe(url: String, userAgent: String = DEFAULT_UA): ProbeResult {
@@ -301,7 +412,20 @@ class SegmentedHttpCache(
 
     private fun sanitizeContentType(raw: String?): String {
       if (raw.isNullOrBlank()) return "video/mp4"
-      return raw.substringBefore(';').trim().ifBlank { "video/mp4" }
+      val clean = raw.substringBefore(';').trim().lowercase(Locale.US)
+      if (clean.isBlank()) return "video/mp4"
+      // CDN often serves progressive mp4 as application/octet-stream — mpv needs video/*.
+      if (clean == "application/octet-stream" ||
+        clean == "binary/octet-stream" ||
+        clean == "application/force-download" ||
+        clean == "application/download"
+      ) {
+        return "video/mp4"
+      }
+      if (clean.startsWith("video/") || clean.startsWith("audio/")) return clean
+      // Unknown non-media type — still prefer video/mp4 for progressive files.
+      if (clean.startsWith("text/")) return "video/mp4"
+      return clean
     }
 
     fun openConnection(url: String, userAgent: String): HttpURLConnection {
@@ -355,8 +479,11 @@ class SegmentedHttpCache(
       // Bind IPv4 loopback only — mpv gets http://127.0.0.1:port/...
       val ss = ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"))
       serverSocket = ss
-      localUrl = "http://127.0.0.1:${ss.localPort}/media"
+      // .mp4 extension helps libmpv pick the demuxer when Content-Type is vague.
+      localUrl = "http://127.0.0.1:${ss.localPort}/media.mp4"
       log("proxy listen $localUrl file=${cacheFile.name}")
+      // Accept clients as soon as the socket is up (before head finishes).
+      serverExecutor.execute { acceptLoop() }
     }
 
     fun downloadRangeBlocking(start: Long, endInclusive: Long): Boolean {
@@ -399,7 +526,7 @@ class SegmentedHttpCache(
     }
 
     fun startBackground(afterOffset: Long) {
-      serverExecutor.execute { acceptLoop() }
+      // acceptLoop already started in init.
       if (afterOffset >= config.totalSize) return
       // Stripe filler: keep multi-conn benefit without scattering holes across the file.
       serverExecutor.execute { stripeFillLoop(afterOffset) }
@@ -526,7 +653,9 @@ class SegmentedHttpCache(
           val maxWrite = (endInclusive + 1 - writePos).toInt()
           if (maxWrite <= 0) break
           val w = min(n, maxWrite)
+          if (!running.get()) break
           synchronized(raf) {
+            if (!running.get()) break
             raf.seek(writePos)
             raf.write(buf, 0, w)
           }
@@ -568,7 +697,10 @@ class SegmentedHttpCache(
           socket.close()
           return
         }
-        log("proxy ${request.method} ${request.path} range=${request.headers["range"]}")
+        log(
+          "proxy ${request.method} ${request.path} " +
+            "range=${request.headers["range"]} ua=${request.headers["user-agent"]}",
+        )
         if (request.method != "GET" && request.method != "HEAD") {
           writeResponse(output, 405, "Method Not Allowed", "text/plain", 0, emptyMap(), null)
           output.flush()

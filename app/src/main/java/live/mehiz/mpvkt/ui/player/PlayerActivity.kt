@@ -157,7 +157,7 @@ class PlayerActivity : AppCompatActivity() {
     )
 
     val wantSegmented = networkPreferences.multiConnectionDownload.get() &&
-      SegmentedHttpCache.isAcceleratableUrl(source)
+      SegmentedHttpCache.shouldTryAccelerate(source)
 
     if (!wantSegmented) {
       // Direct play — same as upstream mpvKt.
@@ -181,8 +181,15 @@ class PlayerActivity : AppCompatActivity() {
 
   private fun playUri(uri: String, useLoadfileCommand: Boolean) {
     // DiagLog uses Log.println — not stripped by R8 optimize.
-    DiagLog.e(TAG, "Loading media: $uri loadfile=$useLoadfileCommand")
-    if (useLoadfileCommand) {
+    val isLocalProxy = uri.startsWith("http://127.0.0.1:") ||
+      uri.startsWith("http://localhost:")
+    DiagLog.e(TAG, "Loading media: $uri loadfile=$useLoadfileCommand proxy=$isLocalProxy")
+    // Local multi-conn proxy: always use loadfile so libmpv opens as network stream.
+    if (useLoadfileCommand || isLocalProxy) {
+      if (isLocalProxy) {
+        // Help lavf treat progressive proxy as seekable http.
+        runCatching { MPVLib.setOptionString("force-seekable", "yes") }
+      }
       MPVLib.command("loadfile", uri)
     } else {
       player.playFile(uri)
@@ -205,8 +212,8 @@ class PlayerActivity : AppCompatActivity() {
    * otherwise the original remote URL.
    */
   private fun maybeAccelerateHttp(uri: String): String {
-    if (!SegmentedHttpCache.isAcceleratableUrl(uri)) {
-      DiagLog.e(TAG, "not acceleratable: $uri")
+    if (!SegmentedHttpCache.shouldTryAccelerate(uri)) {
+      DiagLog.e(TAG, "not try-accelerate: $uri")
       return uri
     }
 
