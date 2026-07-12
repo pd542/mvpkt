@@ -41,7 +41,8 @@
 | 网络超时 | `network-timeout` | 60 s |
 | 流缓冲 | `stream-buffer-size` | 128 KiB |
 | TLS 校验 | `tls-verify` | 开 |
-| 串流优化 | `force-seekable` / `hr-seek` / `stream-lavf-o` reconnect | 开 |
+| 串流优化 | `force-seekable` / `hr-seek`（可选） | 关 |
+| 长暂停续播 | 保守 `stream-lavf-o` reconnect + 暂停≥30s 后 unpause 时 seek 重开流 | 默认开 |
 
 更细的 mpv 参数仍可通过 **高级 → mpv.conf** 覆盖。
 

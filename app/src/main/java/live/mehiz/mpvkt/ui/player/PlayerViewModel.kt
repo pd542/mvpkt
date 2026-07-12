@@ -148,7 +148,7 @@ class PlayerViewModel(
         _remainingTime.value = time
         delay(1000)
       }
-      MPVLib.setPropertyBoolean("pause", true)
+      pause()
       Toast.makeText(activity, activity.getString(R.string.toast_sleep_timer_ended), Toast.LENGTH_SHORT).show()
     }
   }
@@ -190,9 +190,24 @@ class PlayerViewModel(
     }
   }
 
-  fun pauseUnpause() = MPVLib.command("cycle", "pause")
-  fun pause() = MPVLib.setPropertyBoolean("pause", true)
-  fun unpause() = MPVLib.setPropertyBoolean("pause", false)
+  fun pauseUnpause() {
+    if (MPVLib.getPropertyBoolean("pause") == true) {
+      unpause()
+    } else {
+      pause()
+    }
+  }
+
+  fun pause() {
+    LongPauseRecovery.markPaused()
+    MPVLib.setPropertyBoolean("pause", true)
+  }
+
+  fun unpause() {
+    LongPauseRecovery.recoverIfNeeded()
+    MPVLib.setPropertyBoolean("pause", false)
+    LongPauseRecovery.markPlaying()
+  }
 
   private val showStatusBar = playerPreferences.showSystemStatusBar.get()
   fun showControls() {

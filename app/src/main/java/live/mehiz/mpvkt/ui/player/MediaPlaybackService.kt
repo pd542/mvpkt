@@ -53,7 +53,16 @@ class MediaPlaybackService : MediaBrowserServiceCompat(), MPVLib.EventObserver {
     get() = (MPVLib.getPropertyDouble("duration")?.times(1000L))?.toLong()
   private var paused: Boolean?
     get() = MPVLib.getPropertyBoolean("pause")
-    set(value) = MPVLib.command("set", "pause", if (value == true) "yes" else "no")
+    set(value) {
+      if (value == true) {
+        LongPauseRecovery.markPaused()
+        MPVLib.command("set", "pause", "yes")
+      } else {
+        LongPauseRecovery.recoverIfNeeded()
+        MPVLib.command("set", "pause", "no")
+        LongPauseRecovery.markPlaying()
+      }
+    }
 
   private lateinit var mediaSession: MediaSessionCompat
 
