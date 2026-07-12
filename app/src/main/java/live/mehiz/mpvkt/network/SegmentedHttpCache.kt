@@ -951,9 +951,11 @@ class SegmentedHttpCache(
       val ranges = store.snapshot()
       runCatching {
         indexFile.parentFile?.mkdirs()
-        indexFile.writeText(ranges.joinToString(separator = "\n", postfix = "\n") { (start, end) ->
-          "$start-$end"
-        })
+        indexFile.writeText(
+          ranges.joinToString(separator = "\n", postfix = "\n") { (start, end) ->
+            "$start-$end"
+          },
+        )
       }
     }
 
