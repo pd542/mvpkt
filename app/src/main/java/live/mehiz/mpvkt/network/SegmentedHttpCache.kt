@@ -515,6 +515,7 @@ class SegmentedHttpCache(
     private val serverExecutor = Executors.newCachedThreadPool()
     private val running = AtomicBoolean(true)
     private val downloaded = AtomicLong(0)
+
     /** Playback/seek head — background filler yields to this region first. */
     private val priorityStart = AtomicLong(-1L)
     private val priorityEnd = AtomicLong(-1L)
