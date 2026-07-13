@@ -26,6 +26,8 @@ import java.net.Socket
 import java.net.URL
 import java.util.Locale
 import java.util.TreeMap
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.LinkedBlockingQueue
@@ -148,8 +150,8 @@ class SegmentedHttpCache(
     private const val MIN_CHUNK = 256 * 1024
     private const val MAX_CHUNK = 4 * 1024 * 1024
 
-    /** Contiguous head downloaded before playback starts. */
-    private const val HEAD_BYTES = 4L * 1024L * 1024L
+    /** Contiguous head downloaded before playback starts. Keep small so URL load/seek starts quickly. */
+    private const val HEAD_BYTES = 1L * 1024L * 1024L
 
     /** Tail for container index (moov / cues) at end of file. */
     private const val TAIL_BYTES = 1L * 1024L * 1024L
@@ -169,6 +171,9 @@ class SegmentedHttpCache(
 
     /** Prefer asking for at least this many bytes ahead of the read cursor. */
     private const val MIN_STREAM_BYTES = 256L * 1024L
+
+    /** First bytes needed to answer a seek quickly; more data is prefetched in background. */
+    private const val SEEK_START_BYTES = 128L * 1024L
 
     /** Soft cap on empty-read retries before aborting one response body. */
     private const val BODY_IDLE_ROUNDS_MAX = 80
@@ -492,6 +497,7 @@ class SegmentedHttpCache(
     private val serverExecutor = Executors.newCachedThreadPool()
     private val running = AtomicBoolean(true)
     private val downloaded = AtomicLong(0)
+    private val inFlightRanges = ConcurrentHashMap<String, CompletableFuture<Boolean>>()
 
     /**
      * Playback/seek head — background filler yields to this region first.
@@ -663,9 +669,7 @@ class SegmentedHttpCache(
         val stop = rangeEnd
         pos = rangeEnd + 1
         scheduled++
-        jobs += executor.submit {
-          downloadRangeBlocking(start, stop)
-        }
+        jobs += scheduleRangeDownload(start, stop)
       }
       if (jobs.isEmpty()) {
         return store.contiguousFrom(from) > 0 || store.isFullyCovered(from, end)
@@ -738,14 +742,14 @@ class SegmentedHttpCache(
           val start = stripePos
           val end = min(config.totalSize, start + chunk) - 1
           stripePos = end + 1
-          jobs += executor.submit {
+          jobs += scheduleRangeDownload(start, end) {
             // Skip only if a real seek happened after schedule and this slice is
             // far from the new playhead — do not drop work for progressive reads.
             if (priorityGen.get() != genAtSchedule) {
               val p = activePriorityWindow()
-              if (p != null && (end < p.first || start > p.second)) return@submit
+              if (p != null && (end < p.first || start > p.second)) return@scheduleRangeDownload false
             }
-            downloadRangeBlocking(start, end)
+            true
           }
         }
         if (jobs.isEmpty()) {
@@ -780,6 +784,30 @@ class SegmentedHttpCache(
         }
       }
       log("stripe fill done downloaded=${downloaded.get()}/${config.totalSize}")
+    }
+
+    private fun scheduleRangeDownload(
+      start: Long,
+      endInclusive: Long,
+      shouldRun: () -> Boolean = { true },
+    ): Future<Boolean> {
+      if (store.isFullyCovered(start, endInclusive + 1)) {
+        return CompletableFuture.completedFuture(true)
+      }
+      val key = "$start-$endInclusive"
+      return inFlightRanges.computeIfAbsent(key) {
+        val future = CompletableFuture<Boolean>()
+        executor.execute {
+          try {
+            future.complete(shouldRun() && downloadRangeBlocking(start, endInclusive))
+          } catch (e: Exception) {
+            future.complete(false)
+          } finally {
+            inFlightRanges.remove(key, future)
+          }
+        }
+        future
+      }
     }
 
     private fun tryDownloadOnce(start: Long, endInclusive: Long, retries: Int): Boolean {
@@ -914,10 +942,12 @@ class SegmentedHttpCache(
           val length = to - from + 1
           // Block briefly for the first slice, then stream via BodyReader.
           // Keep enough headroom for demux without multi-second freezes.
-          val firstSliceEnd = min(
-            to + 1,
-            from + maxOf(config.chunkBytes.toLong(), MIN_STREAM_BYTES),
-          )
+          val firstSliceBytes = if (from == 0L) {
+            maxOf(config.chunkBytes.toLong(), MIN_STREAM_BYTES)
+          } else {
+            SEEK_START_BYTES
+          }
+          val firstSliceEnd = min(to + 1, from + firstSliceBytes)
           setPlayheadPriority(from, min(config.totalSize, from + MAX_PRIORITY_AHEAD))
           val pre = ensureRange(from, firstSliceEnd, 8_000L)
           log("proxy 206 $from-$to firstSlice=$pre need=${firstSliceEnd - from}")

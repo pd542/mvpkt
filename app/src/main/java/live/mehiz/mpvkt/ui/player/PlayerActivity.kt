@@ -135,6 +135,8 @@ class PlayerActivity : AppCompatActivity() {
     setupMPV()
     setupAudio()
     setupMediaSession()
+    // Wipe any leftover segmented files from a previous process before opening a URL.
+    clearSegmentedPlaybackCache()
     // Default path matches upstream: resolve URI and play immediately on main thread.
     // Multi-connection (optional) only runs on a background thread when explicitly enabled.
     startPlayback(intent, useLoadfileCommand = false)
