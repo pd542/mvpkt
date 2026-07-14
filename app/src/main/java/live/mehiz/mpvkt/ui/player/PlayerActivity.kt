@@ -24,6 +24,7 @@ import android.util.Rational
 import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.annotation.RequiresApi
@@ -46,6 +47,7 @@ import `is`.xyz.mpv.MPVLib
 import `is`.xyz.mpv.MPVNode
 import `is`.xyz.mpv.Utils
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -90,6 +92,11 @@ class PlayerActivity : AppCompatActivity() {
 
   /** Multi-connection Range downloader + local proxy (progressive HTTP only). */
   private var segmentedHttpCache: SegmentedHttpCache? = null
+  private var segmentedSourceUrl: String? = null
+  private var segmentedWatchdogJob: kotlinx.coroutines.Job? = null
+  private var segmentedReconnectInProgress = false
+  private var segmentedPendingSeek: Int? = null
+  private var lastSegmentedReconnectAtMs = 0L
 
   private var audioFocusRequest: AudioFocusRequestCompat? = null
   private var restoreAudioFocus: () -> Unit = {}
@@ -161,6 +168,8 @@ class PlayerActivity : AppCompatActivity() {
       SegmentedHttpCache.shouldTryAccelerate(source)
 
     if (!wantSegmented) {
+      segmentedSourceUrl = null
+      stopSegmentedWatchdog()
       // Direct play — same as upstream mpvKt.
       playUri(source, useLoadfileCommand)
       return
@@ -173,12 +182,12 @@ class PlayerActivity : AppCompatActivity() {
         runCatching { maybeAccelerateHttp(source) }.getOrDefault(source)
       }
       playUri(playable, useLoadfileCommand)
+      if (playable.isLocalSegmentedProxy()) startSegmentedWatchdog() else stopSegmentedWatchdog()
     }
   }
 
   private fun playUri(uri: String, useLoadfileCommand: Boolean) {
-    val isLocalProxy = uri.startsWith("http://127.0.0.1:") ||
-      uri.startsWith("http://localhost:")
+    val isLocalProxy = uri.isLocalSegmentedProxy()
     // Local multi-conn proxy: always use loadfile so libmpv opens as network stream.
     if (useLoadfileCommand || isLocalProxy) {
       if (isLocalProxy) {
@@ -223,6 +232,7 @@ class PlayerActivity : AppCompatActivity() {
     val result = accelerator.open(uri)
     return if (result.usedSegmented) {
       segmentedHttpCache = accelerator
+      segmentedSourceUrl = uri
       result.playPath
     } else {
       accelerator.deleteCache()
@@ -235,8 +245,10 @@ class PlayerActivity : AppCompatActivity() {
    * Called on player exit, media switch, and end-of-file so app data does not grow.
    */
   private fun clearSegmentedPlaybackCache() {
+    stopSegmentedWatchdog()
     segmentedHttpCache?.deleteCache()
     segmentedHttpCache = null
+    segmentedSourceUrl = null
     purgeSegmentedHttpCacheDir()
   }
 
@@ -249,6 +261,106 @@ class PlayerActivity : AppCompatActivity() {
       }
     }
   }
+
+  private fun startSegmentedWatchdog() {
+    if (segmentedWatchdogJob?.isActive == true) return
+    segmentedWatchdogJob = lifecycleScope.launch {
+      var lastPos = viewModel.pos ?: 0
+      var lastPlaybackProgressAtMs = System.currentTimeMillis()
+      while (!player.isExiting) {
+        delay(SEGMENTED_WATCHDOG_INTERVAL_MS)
+        val cache = segmentedHttpCache ?: break
+        val snapshot = cache.snapshot() ?: continue
+        val pos = viewModel.pos ?: continue
+        val duration = viewModel.duration ?: continue
+        val now = System.currentTimeMillis()
+        if (pos > lastPos) {
+          lastPos = pos
+          lastPlaybackProgressAtMs = now
+        }
+        if (viewModel.paused == true || duration <= 0 || snapshot.fullyCached || !snapshot.running) continue
+        val byteOffset = ((snapshot.totalSize.toDouble() * pos.toDouble()) / duration.toDouble()).toLong()
+          .coerceIn(0L, snapshot.totalSize)
+        val cachedAhead = cache.cachedAheadFrom(byteOffset)
+        val stalled = now - snapshot.lastWriteAtMs >= SEGMENTED_STALL_TIMEOUT_MS &&
+          now - lastPlaybackProgressAtMs >= SEGMENTED_STALL_TIMEOUT_MS &&
+          cachedAhead < SEGMENTED_MIN_CACHED_AHEAD_BYTES
+        val cooledDown = now - lastSegmentedReconnectAtMs >= SEGMENTED_RECONNECT_COOLDOWN_MS
+        if (stalled && cooledDown && !segmentedReconnectInProgress) {
+          reconnectSegmentedCache(pos)
+          lastSegmentedReconnectAtMs = now
+          lastPlaybackProgressAtMs = now
+        }
+      }
+    }
+  }
+
+  private fun stopSegmentedWatchdog() {
+    segmentedWatchdogJob?.cancel()
+    segmentedWatchdogJob = null
+    segmentedReconnectInProgress = false
+    segmentedPendingSeek = null
+  }
+
+  private fun reconnectSegmentedCache(position: Int) {
+    val source = segmentedSourceUrl ?: return
+    segmentedReconnectInProgress = true
+    segmentedWatchdogJob?.cancel()
+    segmentedWatchdogJob = null
+    Toast.makeText(this, "网络卡住，正在重新连接", Toast.LENGTH_SHORT).show()
+    lifecycleScope.launch {
+      val oldCache = segmentedHttpCache
+      segmentedHttpCache = null
+      val reopened = withContext(Dispatchers.IO) {
+        oldCache?.deleteCache()
+        purgeSegmentedHttpCacheDir()
+        val connections = networkPreferences.multiConnectionCount.get().coerceIn(2, 16)
+        val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 4096)
+        val cacheRoot = File(cacheDir, "segmented-http").also { it.mkdirs() }
+        val accelerator = SegmentedHttpCache(
+          cacheDir = cacheRoot,
+          connections = connections,
+          chunkBytes = chunkKb * 1024,
+        )
+        val result = accelerator.open(source)
+        if (result.usedSegmented) {
+          accelerator to result.playPath
+        } else {
+          accelerator.deleteCache()
+          null to null
+        }
+      }
+      val cache = reopened.first
+      val playPath = reopened.second
+      if (cache == null || playPath == null) {
+        segmentedSourceUrl = source
+        segmentedReconnectInProgress = false
+        startSegmentedWatchdog()
+        return@launch
+      }
+      segmentedHttpCache = cache
+      segmentedSourceUrl = source
+      segmentedPendingSeek = position
+      playUri(playPath, useLoadfileCommand = true)
+      // The watchdog restarts after the reloaded file is actually loaded.
+      startSegmentedWatchdog()
+    }
+  }
+
+  private fun onSegmentedReloaded() {
+    val seekPosition = segmentedPendingSeek ?: run {
+      segmentedReconnectInProgress = false
+      if (segmentedHttpCache != null) startSegmentedWatchdog()
+      return
+    }
+    segmentedPendingSeek = null
+    segmentedReconnectInProgress = false
+    MPVLib.command("seek", seekPosition.toString(), "absolute+keyframes")
+    startSegmentedWatchdog()
+  }
+
+  private fun String.isLocalSegmentedProxy(): Boolean = startsWith("http://127.0.0.1:") ||
+    startsWith("http://localhost:")
 
   override fun onDestroy() {
     Log.d(TAG, "Exiting")
@@ -362,6 +474,9 @@ class PlayerActivity : AppCompatActivity() {
 
     if (serviceBound) {
       endBackgroundPlayback()
+    }
+    if (segmentedHttpCache != null) {
+      startSegmentedWatchdog()
     }
   }
 
@@ -683,6 +798,7 @@ class PlayerActivity : AppCompatActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
           loadVideoPlaybackState(fileName)
         }
+        onSegmentedReloaded()
         setOrientation()
         viewModel.changeVideoAspect(playerPreferences.videoAspect.get())
       }
@@ -994,6 +1110,10 @@ class PlayerActivity : AppCompatActivity() {
   companion object {
     // action of result intent
     private const val RESULT_INTENT = "live.mehiz.mpvkt.ui.player.PlayerActivity.result"
+    private const val SEGMENTED_WATCHDOG_INTERVAL_MS = 1_000L
+    private const val SEGMENTED_STALL_TIMEOUT_MS = 10_000L
+    private const val SEGMENTED_MIN_CACHED_AHEAD_BYTES = 256L * 1024L
+    private const val SEGMENTED_RECONNECT_COOLDOWN_MS = 20_000L
   }
 }
 

@@ -69,6 +69,14 @@ class SegmentedHttpCache(
     val finalUrl: String,
   )
 
+  data class CacheSnapshot(
+    val totalSize: Long,
+    val downloadedBytes: Long,
+    val fullyCached: Boolean,
+    val lastWriteAtMs: Long,
+    val running: Boolean,
+  )
+
   /**
    * Open segmented session. On failure [OpenResult.playPath] is [originalUrl]
    * and [OpenResult.usedSegmented] is false.
@@ -137,6 +145,10 @@ class SegmentedHttpCache(
   fun close() = shutdownQuietly(deleteCache = true)
 
   fun deleteCache() = shutdownQuietly(deleteCache = true)
+
+  fun snapshot(): CacheSnapshot? = session?.snapshot()
+
+  fun cachedAheadFrom(byteOffset: Long): Long = session?.cachedAheadFrom(byteOffset) ?: 0L
 
   private fun shutdownQuietly(deleteCache: Boolean) {
     session?.close(deleteCache)
@@ -497,6 +509,7 @@ class SegmentedHttpCache(
     private val serverExecutor = Executors.newCachedThreadPool()
     private val running = AtomicBoolean(true)
     private val downloaded = AtomicLong(0)
+    private val lastWriteAtMs = AtomicLong(System.currentTimeMillis())
     private val inFlightRanges = ConcurrentHashMap<String, CompletableFuture<Boolean>>()
 
     /**
@@ -545,6 +558,16 @@ class SegmentedHttpCache(
     fun downloadRangeBlocking(start: Long, endInclusive: Long): Boolean {
       return tryDownloadOnce(start, endInclusive, retries = 3)
     }
+
+    fun snapshot(): CacheSnapshot = CacheSnapshot(
+      totalSize = config.totalSize,
+      downloadedBytes = downloaded.get(),
+      fullyCached = store.isFullyCovered(0L, config.totalSize),
+      lastWriteAtMs = lastWriteAtMs.get(),
+      running = running.get(),
+    )
+
+    fun cachedAheadFrom(byteOffset: Long): Long = store.contiguousFrom(byteOffset.coerceIn(0L, config.totalSize))
 
     /**
      * Mark [start, endExclusive) as the live playback window.
@@ -891,6 +914,7 @@ class SegmentedHttpCache(
           writePos += w
           written += w
           downloaded.addAndGet(w.toLong())
+          lastWriteAtMs.set(System.currentTimeMillis())
           store.mark(from, writePos)
         }
       } finally {
