@@ -264,35 +264,73 @@ class PlayerActivity : AppCompatActivity() {
 
   private fun startSegmentedWatchdog() {
     if (segmentedWatchdogJob?.isActive == true) return
-    segmentedWatchdogJob = lifecycleScope.launch {
-      var lastPos = viewModel.pos ?: 0
-      var lastPlaybackProgressAtMs = System.currentTimeMillis()
-      while (!player.isExiting) {
-        delay(SEGMENTED_WATCHDOG_INTERVAL_MS)
-        val cache = segmentedHttpCache ?: break
-        val snapshot = cache.snapshot() ?: continue
-        val pos = viewModel.pos ?: continue
-        val duration = viewModel.duration ?: continue
-        val now = System.currentTimeMillis()
-        if (pos > lastPos) {
-          lastPos = pos
-          lastPlaybackProgressAtMs = now
-        }
-        if (viewModel.paused == true || duration <= 0 || snapshot.fullyCached || !snapshot.running) continue
-        val byteOffset = ((snapshot.totalSize.toDouble() * pos.toDouble()) / duration.toDouble()).toLong()
-          .coerceIn(0L, snapshot.totalSize)
-        val cachedAhead = cache.cachedAheadFrom(byteOffset)
-        val stalled = now - snapshot.lastWriteAtMs >= SEGMENTED_STALL_TIMEOUT_MS &&
-          now - lastPlaybackProgressAtMs >= SEGMENTED_STALL_TIMEOUT_MS &&
-          cachedAhead < SEGMENTED_MIN_CACHED_AHEAD_BYTES
-        val cooledDown = now - lastSegmentedReconnectAtMs >= SEGMENTED_RECONNECT_COOLDOWN_MS
-        if (stalled && cooledDown && !segmentedReconnectInProgress) {
-          reconnectSegmentedCache(pos)
-          lastSegmentedReconnectAtMs = now
-          lastPlaybackProgressAtMs = now
-        }
+    segmentedWatchdogJob = lifecycleScope.launch { runSegmentedWatchdog() }
+  }
+
+  private suspend fun runSegmentedWatchdog() {
+    var lastPos = viewModel.pos ?: 0
+    var lastPlaybackProgressAtMs = System.currentTimeMillis()
+    while (!player.isExiting) {
+      delay(SEGMENTED_WATCHDOG_INTERVAL_MS)
+      val cache = segmentedHttpCache ?: return
+      val snapshot = cache.snapshot() ?: return
+      val pos = viewModel.pos
+      val duration = viewModel.duration
+      val now = System.currentTimeMillis()
+      if (pos != null && pos > lastPos) {
+        lastPos = pos
+        lastPlaybackProgressAtMs = now
+      }
+      if (shouldSkipSegmentedWatchdog(snapshot, duration, now, lastPlaybackProgressAtMs)) {
+        continue
+      }
+      if (pos != null && duration != null && shouldReconnectSegmentedCache(cache, snapshot, pos, duration, now, lastPlaybackProgressAtMs)) {
+        reconnectSegmentedCache(pos)
+        lastSegmentedReconnectAtMs = now
+        lastPlaybackProgressAtMs = now
+        return
       }
     }
+  }
+
+  private fun shouldSkipSegmentedWatchdog(
+    snapshot: SegmentedHttpCache.CacheSnapshot,
+    duration: Int?,
+    now: Long,
+    lastPlaybackProgressAtMs: Long,
+  ): Boolean {
+    if (viewModel.paused == true) return true
+    if (duration == null || duration <= 0) return true
+    if (snapshot.fullyCached || !snapshot.running) return true
+    if (now - snapshot.lastWriteAtMs < SEGMENTED_STALL_TIMEOUT_MS) return true
+    if (now - lastPlaybackProgressAtMs < SEGMENTED_STALL_TIMEOUT_MS) return true
+    return false
+  }
+
+  private fun hasSegmentedCacheAhead(
+    cache: SegmentedHttpCache,
+    snapshot: SegmentedHttpCache.CacheSnapshot,
+    position: Int,
+    duration: Int,
+  ): Boolean {
+    val byteOffset = ((snapshot.totalSize.toDouble() * position.toDouble()) / duration.toDouble()).toLong()
+      .coerceIn(0L, snapshot.totalSize)
+    return cache.cachedAheadFrom(byteOffset) >= SEGMENTED_MIN_CACHED_AHEAD_BYTES
+  }
+
+  private fun shouldReconnectSegmentedCache(
+    cache: SegmentedHttpCache,
+    snapshot: SegmentedHttpCache.CacheSnapshot,
+    position: Int,
+    duration: Int,
+    now: Long,
+    lastPlaybackProgressAtMs: Long,
+  ): Boolean {
+    if (now - lastSegmentedReconnectAtMs < SEGMENTED_RECONNECT_COOLDOWN_MS) return false
+    if (segmentedReconnectInProgress) return false
+    if (hasSegmentedCacheAhead(cache, snapshot, position, duration)) return false
+    return now - snapshot.lastWriteAtMs >= SEGMENTED_STALL_TIMEOUT_MS &&
+      now - lastPlaybackProgressAtMs >= SEGMENTED_STALL_TIMEOUT_MS
   }
 
   private fun stopSegmentedWatchdog() {
