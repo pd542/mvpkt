@@ -114,6 +114,15 @@ class PlayerActivity : AppCompatActivity() {
     val audioDelay: Int,
   )
 
+  private data class SegmentedWatchdogState(
+    val cache: SegmentedHttpCache,
+    val snapshot: SegmentedHttpCache.CacheSnapshot,
+    val position: Int?,
+    val duration: Int?,
+    val now: Long,
+    val lastPlaybackProgressAtMs: Long,
+  )
+
   private var pipRect: android.graphics.Rect? = null
   val isPipSupported by lazy {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
@@ -270,67 +279,72 @@ class PlayerActivity : AppCompatActivity() {
   private suspend fun runSegmentedWatchdog() {
     var lastPos = viewModel.pos ?: 0
     var lastPlaybackProgressAtMs = System.currentTimeMillis()
-    while (!player.isExiting) {
+    var keepWatching = true
+    while (keepWatching && !player.isExiting) {
       delay(SEGMENTED_WATCHDOG_INTERVAL_MS)
-      val cache = segmentedHttpCache ?: return
-      val snapshot = cache.snapshot() ?: return
-      val pos = viewModel.pos
-      val duration = viewModel.duration
-      val now = System.currentTimeMillis()
-      if (pos != null && pos > lastPos) {
-        lastPos = pos
-        lastPlaybackProgressAtMs = now
-      }
-      if (shouldSkipSegmentedWatchdog(snapshot, duration, now, lastPlaybackProgressAtMs)) {
-        continue
-      }
-      if (pos != null && duration != null && shouldReconnectSegmentedCache(cache, snapshot, pos, duration, now, lastPlaybackProgressAtMs)) {
-        reconnectSegmentedCache(pos)
-        lastSegmentedReconnectAtMs = now
-        lastPlaybackProgressAtMs = now
-        return
+      val state = currentSegmentedWatchdogState(lastPlaybackProgressAtMs)
+      if (state == null) {
+        keepWatching = false
+      } else {
+        state.position?.let { position ->
+          if (position > lastPos) {
+            lastPos = position
+            lastPlaybackProgressAtMs = state.now
+          }
+        }
+        if (shouldReconnectSegmentedCache(state)) {
+          reconnectSegmentedCache(state.position ?: 0)
+          lastSegmentedReconnectAtMs = state.now
+          keepWatching = false
+        }
       }
     }
   }
 
-  private fun shouldSkipSegmentedWatchdog(
-    snapshot: SegmentedHttpCache.CacheSnapshot,
-    duration: Int?,
-    now: Long,
-    lastPlaybackProgressAtMs: Long,
-  ): Boolean {
-    if (viewModel.paused == true) return true
-    if (duration == null || duration <= 0) return true
-    if (snapshot.fullyCached || !snapshot.running) return true
-    if (now - snapshot.lastWriteAtMs < SEGMENTED_STALL_TIMEOUT_MS) return true
-    if (now - lastPlaybackProgressAtMs < SEGMENTED_STALL_TIMEOUT_MS) return true
-    return false
+  private fun currentSegmentedWatchdogState(lastPlaybackProgressAtMs: Long): SegmentedWatchdogState? {
+    val cache = segmentedHttpCache
+    val snapshot = cache?.snapshot()
+    return if (cache != null && snapshot != null) {
+      SegmentedWatchdogState(
+        cache = cache,
+        snapshot = snapshot,
+        position = viewModel.pos,
+        duration = viewModel.duration,
+        now = System.currentTimeMillis(),
+        lastPlaybackProgressAtMs = lastPlaybackProgressAtMs,
+      )
+    } else {
+      null
+    }
   }
 
-  private fun hasSegmentedCacheAhead(
-    cache: SegmentedHttpCache,
-    snapshot: SegmentedHttpCache.CacheSnapshot,
-    position: Int,
-    duration: Int,
-  ): Boolean {
-    val byteOffset = ((snapshot.totalSize.toDouble() * position.toDouble()) / duration.toDouble()).toLong()
-      .coerceIn(0L, snapshot.totalSize)
-    return cache.cachedAheadFrom(byteOffset) >= SEGMENTED_MIN_CACHED_AHEAD_BYTES
+  private fun shouldSkipSegmentedWatchdog(state: SegmentedWatchdogState): Boolean {
+    val inactive = viewModel.paused == true ||
+      state.duration == null ||
+      state.duration <= 0 ||
+      state.position == null ||
+      state.snapshot.fullyCached ||
+      !state.snapshot.running
+    val freshWrite = state.now - state.snapshot.lastWriteAtMs < SEGMENTED_STALL_TIMEOUT_MS
+    val progressing = state.now - state.lastPlaybackProgressAtMs < SEGMENTED_STALL_TIMEOUT_MS
+    return inactive || freshWrite || progressing
   }
 
-  private fun shouldReconnectSegmentedCache(
-    cache: SegmentedHttpCache,
-    snapshot: SegmentedHttpCache.CacheSnapshot,
-    position: Int,
-    duration: Int,
-    now: Long,
-    lastPlaybackProgressAtMs: Long,
-  ): Boolean {
-    if (now - lastSegmentedReconnectAtMs < SEGMENTED_RECONNECT_COOLDOWN_MS) return false
-    if (segmentedReconnectInProgress) return false
-    if (hasSegmentedCacheAhead(cache, snapshot, position, duration)) return false
-    return now - snapshot.lastWriteAtMs >= SEGMENTED_STALL_TIMEOUT_MS &&
-      now - lastPlaybackProgressAtMs >= SEGMENTED_STALL_TIMEOUT_MS
+  private fun hasSegmentedCacheAhead(state: SegmentedWatchdogState): Boolean {
+    val duration = state.duration ?: return true
+    val position = state.position ?: return true
+    val byteOffset = (
+      (state.snapshot.totalSize.toDouble() * position.toDouble()) / duration.toDouble()
+    ).toLong().coerceIn(0L, state.snapshot.totalSize)
+    return state.cache.cachedAheadFrom(byteOffset) >= SEGMENTED_MIN_CACHED_AHEAD_BYTES
+  }
+
+  private fun shouldReconnectSegmentedCache(state: SegmentedWatchdogState): Boolean {
+    val cooledDown = state.now - lastSegmentedReconnectAtMs >= SEGMENTED_RECONNECT_COOLDOWN_MS
+    return !shouldSkipSegmentedWatchdog(state) &&
+      cooledDown &&
+      !segmentedReconnectInProgress &&
+      !hasSegmentedCacheAhead(state)
   }
 
   private fun stopSegmentedWatchdog() {
