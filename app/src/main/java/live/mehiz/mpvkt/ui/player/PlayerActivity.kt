@@ -279,25 +279,18 @@ class PlayerActivity : AppCompatActivity() {
   private suspend fun runSegmentedWatchdog() {
     var lastPos = viewModel.pos ?: 0
     var lastPlaybackProgressAtMs = System.currentTimeMillis()
-    var keepWatching = true
-    while (keepWatching && !player.isExiting) {
+    while (!player.isExiting) {
       delay(SEGMENTED_WATCHDOG_INTERVAL_MS)
-      val state = currentSegmentedWatchdogState(lastPlaybackProgressAtMs)
-      if (state == null) {
-        keepWatching = false
-      } else {
-        state.position?.let { position ->
-          if (position > lastPos) {
-            lastPos = position
-            lastPlaybackProgressAtMs = state.now
-          }
-        }
-        if (shouldReconnectSegmentedCache(state)) {
-          reconnectSegmentedCache(state.position ?: 0)
-          lastSegmentedReconnectAtMs = state.now
-          keepWatching = false
-        }
+      val state = currentSegmentedWatchdogState(lastPlaybackProgressAtMs) ?: return
+      val position = state.position
+      if (position != null && position > lastPos) {
+        lastPos = position
+        lastPlaybackProgressAtMs = state.now
       }
+      if (!shouldReconnectSegmentedCache(state)) continue
+      reconnectSegmentedCache(position ?: 0)
+      lastSegmentedReconnectAtMs = state.now
+      return
     }
   }
 
@@ -331,12 +324,17 @@ class PlayerActivity : AppCompatActivity() {
   }
 
   private fun hasSegmentedCacheAhead(state: SegmentedWatchdogState): Boolean {
-    val duration = state.duration ?: return true
-    val position = state.position ?: return true
-    val byteOffset = (
-      (state.snapshot.totalSize.toDouble() * position.toDouble()) / duration.toDouble()
-    ).toLong().coerceIn(0L, state.snapshot.totalSize)
-    return state.cache.cachedAheadFrom(byteOffset) >= SEGMENTED_MIN_CACHED_AHEAD_BYTES
+    val duration = state.duration
+    val position = state.position
+    val byteOffset = if (duration != null && position != null) {
+      val ratio = state.snapshot.totalSize.toDouble() * position.toDouble()
+      (ratio / duration.toDouble()).toLong().coerceIn(0L, state.snapshot.totalSize)
+    } else {
+      0L
+    }
+    return duration == null ||
+      position == null ||
+      state.cache.cachedAheadFrom(byteOffset) >= SEGMENTED_MIN_CACHED_AHEAD_BYTES
   }
 
   private fun shouldReconnectSegmentedCache(state: SegmentedWatchdogState): Boolean {
