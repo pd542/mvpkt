@@ -96,7 +96,11 @@
     <string name="pref_decoder_gpu_next_summary">A new rendering backend</string>
     <string name="pref_decoder_debanding_title">Debanding</string>
     <string name="pref_decoder_yuv420p_title">Use YUV420P pixel format</string>
-    <string name="pref_decoder_yuv420p_summary">May fix black screens on some video codecs, can also improve performance at the cost of quality</string>
+    <string name="pref_decoder_yuv420p_summary">May fix black screens on some video codecs. Keep off for HDR/Dolby Vision — forcing 8-bit YUV can cause a green cast on Profile 5</string>
+    <string name="pref_decoder_adaptive_title">Adaptive decoder (by stream)</string>
+    <string name="pref_decoder_adaptive_summary">Automatically choose vo / hwdec / pixel format / tone-mapping from the loaded video (DV, HDR10/HLG, 10-bit, SDR)</string>
+    <string name="pref_decoder_auto_fix_dovi_title">Auto-fix Dolby Vision Profile 5 color</string>
+    <string name="pref_decoder_auto_fix_dovi_summary">Legacy: only when Adaptive decoder is off. On DV P5, force gpu-next, drop YUV420P, use software decode for correct IPT color</string>
 
     <string name="pref_subtitles">Subtitles</string>
     <string name="pref_subtitles_summary">Preferred languages, fonts</string>

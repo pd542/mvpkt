@@ -64,7 +64,11 @@
     <string name="pref_decoder_gpu_next_summary">新的视频渲染后端</string>
     <string name="pref_decoder_debanding_title">去色带</string>
     <string name="pref_decoder_yuv420p_title">使用 YUV420P 像素格式</string>
-    <string name="pref_decoder_yuv420p_summary">可能解决某些视频编码的黑屏问题，同时可能在降低质量的情况下提升性能</string>
+    <string name="pref_decoder_yuv420p_summary">可能解决某些视频编码的黑屏问题。播放 HDR/杜比视界时请关闭——强制 8bit YUV 会导致 Profile 5 画面偏绿</string>
+    <string name="pref_decoder_adaptive_title">自适应解码（按片源）</string>
+    <string name="pref_decoder_adaptive_summary">根据当前视频自动选择 vo / 硬软解 / 像素格式 / 色调映射（杜比、HDR10/HLG、10bit、SDR）</string>
+    <string name="pref_decoder_auto_fix_dovi_title">自动修复杜比视界 Profile 5 偏色</string>
+    <string name="pref_decoder_auto_fix_dovi_summary">兼容项：仅在关闭「自适应解码」时生效。检测到 DV P5 时启用 gpu-next、关闭强制 YUV420P 并软件解码，以正确处理 IPT 色彩</string>
     <string name="pref_subtitles">字幕</string>
     <string name="pref_subtitles_summary">首选语言，字体</string>
     <string name="pref_preferred_languages">首选语言</string>

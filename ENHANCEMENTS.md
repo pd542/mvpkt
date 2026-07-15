@@ -14,6 +14,69 @@
 | 视频/音频解码线程 | `vd-lavc-threads` / `ad-lavc-threads`，0=自动 |
 | 解复用独立线程 | `demuxer-thread` |
 | 串流优化 | 断线重连、强制可 seek 等 |
+| 杜比视界 Profile 5 偏色修复 | 默认关闭强制 YUV420P、默认 gpu-next；检测到 DV P5 时自动 SW 解码 + IPT 色调映射 |
+| 自适应解码（按片源） | 加载后探测 codec/gamma/位深/DoVi profile，自动选择 vo/hwdec/vf/tone-mapping |
+
+## 自适应解码（按片源）
+
+**设置 → 解码器 → 自适应解码（按片源）**（默认开）
+
+加载每个文件后（`MPV_EVENT_FILE_LOADED`），`AdaptiveDecoderSelector` 读取 mpv 的 `video-params/*` / track 元数据，套用下表：
+
+| 片源类型 | vo | hwdec | yuv420p | tone-mapping |
+|----------|----|-------|---------|--------------|
+| Dolby Vision **Profile 5**（IPT） | `gpu-next` | `no`（软解） | 关 | `auto` + `hdr-compute-peak=yes` |
+| 其他 Dolby Vision | `gpu-next` | `no` | 关 | 同上 |
+| HDR10 / HLG / 其它 HDR | `gpu-next` | 尊重用户硬解开关 | 关 | 同上 |
+| 10/12bit SDR | 用户 gpu-next 偏好 | 尊重用户硬解开关 | 关 | — |
+| 8bit SDR | 用户 gpu-next 偏好 | 尊重用户硬解开关 | 仅当用户打开兼容项 | — |
+
+用户开关含义（自适应开启时）：
+
+- **尝试硬件解码**：作为“允许硬解”的上限；DV 仍会强制软解以保证色彩。
+- **gpu-next**：SDR 路径的偏好；HDR/DV 仍会强制 `gpu-next`。
+- **YUV420P**：仅 8bit SDR 会应用；HDR/DV/高位深一律忽略。
+- **自动修复 DV P5**：自适应开启时被覆盖（UI 置灰）；关闭自适应后仍可作为旧版仅修 P5 的开关。
+
+实现：
+
+- `ui/player/AdaptiveDecoderSelector.kt`（新建）
+- `ui/player/MPVView.kt` → `applyAdaptiveDecoderIfNeeded()`
+- `ui/player/PlayerActivity.kt` → FILE_LOADED 重试评估
+
+## 杜比视界 Profile 5 偏绿修复
+
+### 现象
+
+4K Dolby Vision **Profile 5**（IPT-PQ 色彩，常见流媒体/网盘源）在本应用中画面内容偏绿；同机 HDR10/HLG 正常，第三方播放器正常。
+
+### 根因
+
+1. **默认 `vf=format=yuv420p`**：把 IPT / 高位深帧强制转成 8bit YCbCr，色彩矩阵被错误解释 → 典型偏绿/偏紫。
+2. **未默认启用 `gpu-next`**：libplacebo 的 DoVi/IPT 色调映射主要在 `vo=gpu-next` 路径。
+3. **Android `mediacodec` 硬解**：通常无法把 DoVi side data 交给 libplacebo，即使开了 gpu-next，P5 仍可能偏色（见 [mpv-android#1081](https://github.com/mpv-android/mpv-android/issues/1081)、[mpv#10287](https://github.com/mpv-player/mpv/issues/10287)）。
+
+### 修复策略
+
+| 项 | 行为 |
+|----|------|
+| `use_yuv420p` 默认 | **关**（旧默认开） |
+| `gpu_next` 默认 | **开** |
+| `auto_fix_dolby_vision`（新） | 默认开；`FILE_LOADED` 后检测 DV P5 |
+| 检测到 P5 时 | `vo=gpu-next`、清空强制 yuv420p、`hwdec=no`、`tone-mapping=auto`、`hdr-compute-peak=yes`，并 seek 重建滤镜图 |
+
+设置入口：**设置 → 解码器**
+
+- 关闭「自动修复杜比视界 Profile 5 偏色」可恢复手动控制。
+- 若设备软解 4K HEVC 吃力，可关自动修复后自行在 `mpv.conf` 试验；Android 上**硬解 + 正确 P5 色调映射**目前仍无稳定通用解。
+
+实现文件：
+
+- `preferences/DecoderPreferences.kt`
+- `ui/player/AdaptiveDecoderSelector.kt`（按片源选参）
+- `ui/player/MPVView.kt`（`applyAdaptiveDecoderIfNeeded` / 遗留 `applyDolbyVisionProfile5FixIfNeeded`）
+- `ui/player/PlayerActivity.kt`（`MPV_EVENT_FILE_LOADED` 重试应用）
+- `ui/preferences/DecoderPreferencesScreen.kt`
 
 ## 设置入口
 
@@ -128,6 +191,9 @@ cd mpvKt
 2. `NetworkPreferencesScreen.kt`（新建）
 3. `PreferencesModule.kt` — 注册 NetworkPreferences
 4. `PreferencesScreen.kt` — 菜单入口
-5. `MPVView.kt` — 应用可配置缓存/线程
-6. `values/strings.xml` / `values-zh-rCN/strings.xml` — 文案
-7. 本文件 `ENHANCEMENTS.md`
+5. `MPVView.kt` — 应用可配置缓存/线程；自适应解码入口
+6. `AdaptiveDecoderSelector.kt`（新建）— 按片源选择 vo/hwdec/vf/tone-mapping
+7. `DecoderPreferences.kt` / `DecoderPreferencesScreen.kt` — 默认值 + 自适应/DV 开关
+8. `PlayerActivity.kt` — FILE_LOADED 后评估自适应解码
+9. `values/strings.xml` / `values-zh-rCN/strings.xml` — 文案
+10. 本文件 `ENHANCEMENTS.md`

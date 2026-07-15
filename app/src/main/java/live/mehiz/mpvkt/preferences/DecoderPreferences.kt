@@ -6,8 +6,19 @@ import live.mehiz.mpvkt.ui.player.Debanding
 
 class DecoderPreferences(preferenceStore: PreferenceStore) {
   val tryHWDecoding = preferenceStore.getBoolean("try_hw_dec", true)
-  val gpuNext = preferenceStore.getBoolean("gpu_next")
-  val useYUV420P = preferenceStore.getBoolean("use_yuv420p", true)
+  // gpu-next is required for correct Dolby Vision (esp. Profile 5 IPT) tonemapping.
+  val gpuNext = preferenceStore.getBoolean("gpu_next", true)
+  // Forced yuv420p strips high-bit-depth / non-YCbCr frames and can turn DV P5 green.
+  // Keep available as an opt-in compatibility switch, but default off.
+  val useYUV420P = preferenceStore.getBoolean("use_yuv420p", false)
+  // Auto-fix DV Profile 5: force gpu-next, drop yuv420p, and fall back to software decode
+  // so libplacebo can apply the IPT→display transform (mediacodec path often cannot).
+  // Kept for backward compatibility; adaptive decoder supersedes this when enabled.
+  val autoFixDolbyVision = preferenceStore.getBoolean("auto_fix_dolby_vision", true)
+
+  // Inspect each loaded stream and pick vo/hwdec/vf/tone-mapping automatically
+  // (DV P5, other DV, HDR10/HLG, 10-bit SDR, 8-bit SDR).
+  val adaptiveDecoder = preferenceStore.getBoolean("adaptive_decoder", true)
 
   val debanding = preferenceStore.getEnum("debanding", Debanding.None)
   val debandIterations = preferenceStore.getInt("deband_iterations", 1)

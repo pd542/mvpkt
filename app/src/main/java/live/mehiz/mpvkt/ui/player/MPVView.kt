@@ -89,8 +89,77 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
     // workaround for <https://github.com/mpv-player/mpv/issues/14651>
     MPVLib.setOptionString("vd-lavc-film-grain", "cpu")
 
+    // Prefer correct HDR/DV handling in libplacebo when available.
+    // Android still tonemaps to the display (no native DV output path here).
+    if (decoderPreferences.gpuNext.get()) {
+      MPVLib.setOptionString("hdr-compute-peak", "yes")
+      MPVLib.setOptionString("tone-mapping", "auto")
+    }
+
     setupSubtitlesOptions()
     setupAudioOptions()
+  }
+
+  /**
+   * Inspect the loaded stream and apply the best decoder/renderer path.
+   *
+   * Covers Dolby Vision P5, other DV, HDR10/HLG, high-bit-depth SDR, and 8-bit SDR.
+   * When adaptive mode is off, falls back to the legacy DV P5-only fix.
+   *
+   * @return true when stream metadata was available and a plan was evaluated
+   *         (whether or not properties changed). false if metadata is not ready yet.
+   */
+  fun applyAdaptiveDecoderIfNeeded(): Boolean {
+    if (decoderPreferences.adaptiveDecoder.get()) {
+      val info = AdaptiveDecoderSelector.probeStreamInfo()
+      if (!info.hasEnoughMetadata()) return false
+      val plan = AdaptiveDecoderSelector.planFor(info, decoderPreferences)
+      AdaptiveDecoderSelector.applyPlan(plan)
+      return true
+    }
+    // Legacy path: only touch DV Profile 5 streams.
+    return applyDolbyVisionProfile5FixIfNeeded()
+  }
+
+  /**
+   * Dolby Vision Profile 5 is IPT-PQ, not YCbCr. Forcing `format=yuv420p` or using
+   * mediacodec without usable DoVi side data commonly yields a green/purple cast.
+   *
+   * Used when [DecoderPreferences.adaptiveDecoder] is disabled but
+   * [DecoderPreferences.autoFixDolbyVision] is still on.
+   */
+  fun applyDolbyVisionProfile5FixIfNeeded(): Boolean {
+    if (!decoderPreferences.autoFixDolbyVision.get()) return false
+
+    val info = AdaptiveDecoderSelector.probeStreamInfo()
+    if (!info.hasEnoughMetadata()) return false
+    if (!info.isProfile5) {
+      restoreUserPixelFormatIfNeeded()
+      return true
+    }
+
+    val plan = AdaptiveDecoderSelector.DecoderPlan(
+      kind = AdaptiveDecoderSelector.StreamKind.DOLBY_VISION_P5,
+      vo = "gpu-next",
+      hwdec = "no",
+      forceYuv420p = false,
+      toneMapping = "auto",
+      hdrComputePeak = "yes",
+      reason = "legacy DV P5 fix",
+    )
+    AdaptiveDecoderSelector.applyPlan(plan)
+    return true
+  }
+
+  fun isDolbyVisionProfile5(): Boolean =
+    AdaptiveDecoderSelector.probeStreamInfo().isProfile5
+
+  /** Re-apply user yuv420p preference after a previous HDR/DV session cleared filters. */
+  private fun restoreUserPixelFormatIfNeeded() {
+    if (!decoderPreferences.useYUV420P.get()) return
+    val vf = MPVLib.getPropertyString("vf") ?: ""
+    if (vf.contains("yuv420p", ignoreCase = true)) return
+    runCatching { MPVLib.command("vf", "set", "format=yuv420p") }
   }
 
   /**
@@ -244,6 +313,9 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
   private val observedProps = mapOf(
     "pause" to MPVLib.mpvFormat.MPV_FORMAT_FLAG,
     "video-params/aspect" to MPVLib.mpvFormat.MPV_FORMAT_DOUBLE,
+    "video-params/gamma" to MPVLib.mpvFormat.MPV_FORMAT_STRING,
+    "video-params/pixelformat" to MPVLib.mpvFormat.MPV_FORMAT_STRING,
+    "video-codec" to MPVLib.mpvFormat.MPV_FORMAT_STRING,
     "eof-reached" to MPVLib.mpvFormat.MPV_FORMAT_FLAG,
 
     "user-data/mpvkt/show_text" to MPVLib.mpvFormat.MPV_FORMAT_STRING,

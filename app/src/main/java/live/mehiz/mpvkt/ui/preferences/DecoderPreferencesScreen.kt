@@ -91,6 +91,25 @@ object DecoderPreferencesScreen : Screen {
             title = { Text(stringResource(R.string.pref_decoder_yuv420p_title)) },
             summary = { Text(stringResource(R.string.pref_decoder_yuv420p_summary)) }
           )
+          val adaptiveDecoder by preferences.adaptiveDecoder.collectAsState()
+          SwitchPreference(
+            value = adaptiveDecoder,
+            onValueChange = {
+              preferences.adaptiveDecoder.set(it)
+            },
+            title = { Text(stringResource(R.string.pref_decoder_adaptive_title)) },
+            summary = { Text(stringResource(R.string.pref_decoder_adaptive_summary)) },
+          )
+          val autoFixDolbyVision by preferences.autoFixDolbyVision.collectAsState()
+          SwitchPreference(
+            value = autoFixDolbyVision,
+            onValueChange = {
+              preferences.autoFixDolbyVision.set(it)
+            },
+            title = { Text(stringResource(R.string.pref_decoder_auto_fix_dovi_title)) },
+            summary = { Text(stringResource(R.string.pref_decoder_auto_fix_dovi_summary)) },
+            enabled = !adaptiveDecoder,
+          )
         }
       }
     }

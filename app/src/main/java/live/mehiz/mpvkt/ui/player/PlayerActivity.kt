@@ -98,6 +98,10 @@ class PlayerActivity : AppCompatActivity() {
   private var segmentedPendingSeek: Int? = null
   private var lastSegmentedReconnectAtMs = 0L
 
+  /** Dedup adaptive decoder re-evaluation while video-params stream in. */
+  private var adaptiveDecoderAppliedForFile = false
+  private var lastAdaptiveDecoderSignature: String? = null
+
   private var audioFocusRequest: AudioFocusRequestCompat? = null
   private var restoreAudioFocus: () -> Unit = {}
 
@@ -816,6 +820,10 @@ class PlayerActivity : AppCompatActivity() {
 
   internal fun onObserverEvent(property: String, value: String) {
     if (player.isExiting) return
+    when (property) {
+      "video-params/gamma", "video-params/pixelformat", "video-codec" ->
+        maybeApplyAdaptiveDecoder("prop:$property")
+    }
     when (property.substringBeforeLast("/")) {
       "user-data/mpvkt" -> viewModel.handleLuaInvocation(property, value)
     }
@@ -835,6 +843,37 @@ class PlayerActivity : AppCompatActivity() {
     }
   }
 
+  /**
+   * Evaluate adaptive decoder once metadata is available.
+   * Re-runs if the stream signature changes (e.g. late gamma/DoVi props).
+   */
+  private fun maybeApplyAdaptiveDecoder(source: String): Boolean {
+    if (player.isExiting) return false
+    val info = runCatching { AdaptiveDecoderSelector.probeStreamInfo() }.getOrNull() ?: return false
+    if (!info.hasEnoughMetadata()) return false
+    val signature = listOf(
+      info.doviProfile?.toString().orEmpty(),
+      info.gamma,
+      info.pixfmt,
+      info.codec,
+      info.width?.toString().orEmpty(),
+      info.height?.toString().orEmpty(),
+      info.isProfile5.toString(),
+      info.isHdr.toString(),
+      info.isHighBitDepth.toString(),
+    ).joinToString("|")
+    if (adaptiveDecoderAppliedForFile && signature == lastAdaptiveDecoderSignature) {
+      return true
+    }
+    val ready = runCatching { player.applyAdaptiveDecoderIfNeeded() }.getOrDefault(false)
+    if (ready) {
+      adaptiveDecoderAppliedForFile = true
+      lastAdaptiveDecoderSignature = signature
+      Log.i(TAG, "Adaptive decoder via $source: $signature")
+    }
+    return ready
+  }
+
   internal fun event(eventId: Int) {
     if (player.isExiting) return
     when (eventId) {
@@ -851,6 +890,20 @@ class PlayerActivity : AppCompatActivity() {
         onSegmentedReloaded()
         setOrientation()
         viewModel.changeVideoAspect(playerPreferences.videoAspect.get())
+        adaptiveDecoderAppliedForFile = false
+        lastAdaptiveDecoderSignature = null
+        // Pick vo/hwdec/vf/tone-mapping from the loaded stream (DV/HDR/SDR…).
+        // video-params may populate slightly after FILE_LOADED; retry a few times.
+        lifecycleScope.launch {
+          repeat(8) { attempt ->
+            if (player.isExiting) return@launch
+            if (maybeApplyAdaptiveDecoder("file-loaded#$attempt")) return@launch
+            delay(200L * (attempt + 1))
+          }
+          if (!adaptiveDecoderAppliedForFile) {
+            Log.w(TAG, "Adaptive decoder: stream metadata not ready after retries")
+          }
+        }
       }
 
       MPVLib.mpvEventId.MPV_EVENT_PLAYBACK_RESTART -> player.isExiting = false
