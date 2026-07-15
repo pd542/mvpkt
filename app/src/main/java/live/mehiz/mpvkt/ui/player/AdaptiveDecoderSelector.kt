@@ -11,6 +11,9 @@ import live.mehiz.mpvkt.preferences.DecoderPreferences
  * Priority is **correct color** over raw throughput when the two conflict
  * (notably Dolby Vision Profile 5 IPT, where mediacodec + forced yuv420p
  * produces a green cast).
+ *
+ * Note: detection helpers avoid complex raw-string Regex inside property
+ * getters — detekt 1.23.x can crash on those PSI ranges in CI.
  */
 object AdaptiveDecoderSelector {
 
@@ -32,35 +35,65 @@ object AdaptiveDecoderSelector {
         .joinToString(" ")
         .lowercase()
 
-    val isDolbyVision: Boolean =
-      doviProfile != null ||
-        blob.contains("dolby") ||
+    val isDolbyVision: Boolean = computeIsDolbyVision()
+
+    val isProfile5: Boolean = computeIsProfile5()
+
+    val isHdr: Boolean = computeIsHdr()
+
+    val isHighBitDepth: Boolean = computeIsHighBitDepth()
+
+    val isUhd: Boolean = computeIsUhd()
+
+    fun hasEnoughMetadata(): Boolean {
+      // Wait until mpv has populated something useful about the video track.
+      return codec.isNotBlank() ||
+        format.isNotBlank() ||
+        gamma.isNotBlank() ||
+        pixfmt.isNotBlank() ||
+        doviProfile != null ||
+        (width != null && width > 0)
+    }
+
+    private fun computeIsDolbyVision(): Boolean {
+      if (doviProfile != null) return true
+      return blob.contains("dolby") ||
         blob.contains("dovi") ||
         blob.contains("dvhe") ||
         blob.contains("dvh1") ||
         blob.contains("dvav") ||
         blob.contains("ipt") ||
         blob.contains("ipt-pq")
-
-    val isProfile5: Boolean {
-      if (doviProfile == 5L) return true
-      if (doviProfile != null && doviProfile != 5L) return false
-      if (blob.contains("ipt") || blob.contains("ictcp") || blob.contains("ipt-pq")) return true
-      if (Regex("""dvhe\.0?5|dvh1\.0?5|profile[_\-.]?5|\bp5\b""", RegexOption.IGNORE_CASE).containsMatchIn(blob)) {
-        return true
-      }
-      if (isDolbyVision) {
-        Regex("""(?:profile|p)\s*[:=]?\s*(\d+)""", RegexOption.IGNORE_CASE)
-          .find(blob)
-          ?.groupValues
-          ?.getOrNull(1)
-          ?.toLongOrNull()
-          ?.let { return it == 5L }
-      }
-      return false
     }
 
-    val isHdr: Boolean {
+    private fun computeIsProfile5(): Boolean {
+      if (doviProfile == 5L) return true
+      if (doviProfile != null) return false
+
+      // Profile 5 exclusive IPT color space markers.
+      if (blob.contains("ipt") || blob.contains("ictcp") || blob.contains("ipt-pq")) {
+        return true
+      }
+
+      // Common single-layer P5 codec ids: dvhe.05 / dvh1.05 / profile 5 / p5.
+      if (blob.contains("dvhe.05") || blob.contains("dvhe.5") ||
+        blob.contains("dvh1.05") || blob.contains("dvh1.5")
+      ) {
+        return true
+      }
+      if (blob.contains("profile 5") || blob.contains("profile=5") ||
+        blob.contains("profile:5") || blob.contains("profile_5") ||
+        blob.contains("profile-5") || blob.contains("profile.5")
+      ) {
+        return true
+      }
+
+      if (!isDolbyVision) return false
+      val parsed = parseProfileNumber(blob)
+      return parsed == 5L
+    }
+
+    private fun computeIsHdr(): Boolean {
       if (isDolbyVision) return true
       if ((sigPeak ?: 0.0) > 1.0) return true
       val g = gamma.lowercase()
@@ -73,8 +106,9 @@ object AdaptiveDecoderSelector {
         blob.contains("hdr")
     }
 
-    val isHighBitDepth: Boolean {
-      bitDepthHint?.let { if (it >= 10) return true }
+    private fun computeIsHighBitDepth(): Boolean {
+      val hint = bitDepthHint
+      if (hint != null && hint >= 10) return true
       val p = pixfmt.lowercase()
       return p.contains("p010") ||
         p.contains("p012") ||
@@ -86,23 +120,15 @@ object AdaptiveDecoderSelector {
         p.contains("10be") ||
         p.contains("12le") ||
         p.contains("16le") ||
-        Regex("""\b(10|12|16)bit\b""").containsMatchIn(blob)
+        blob.contains("10bit") ||
+        blob.contains("12bit") ||
+        blob.contains("16bit")
     }
 
-    val isUhd: Boolean {
+    private fun computeIsUhd(): Boolean {
       val w = width ?: 0
       val h = height ?: 0
       return w >= 3800 || h >= 2100 || w * h >= 3800 * 2000
-    }
-
-    fun hasEnoughMetadata(): Boolean {
-      // Wait until mpv has populated something useful about the video track.
-      return codec.isNotBlank() ||
-        format.isNotBlank() ||
-        gamma.isNotBlank() ||
-        pixfmt.isNotBlank() ||
-        doviProfile != null ||
-        (width != null && width > 0)
     }
   }
 
@@ -231,20 +257,24 @@ object AdaptiveDecoderSelector {
         reason = "10/12-bit SDR → preserve bit depth (no forced yuv420p)",
       )
 
-      else -> DecoderPlan(
-        kind = StreamKind.SDR,
-        vo = if (userGpuNext) "gpu-next" else "gpu",
-        hwdec = if (userHw) "auto" else "no",
-        // Forced yuv420p is only safe-ish for 8-bit SDR compatibility cases.
-        forceYuv420p = userYuv,
-        toneMapping = null,
-        hdrComputePeak = null,
-        reason = if (userYuv) {
+      else -> {
+        val hwLabel = if (userHw) "auto" else "no"
+        val sdrReason = if (userYuv) {
           "8-bit SDR → user yuv420p compatibility filter enabled"
         } else {
-          "8-bit SDR → default path (hwdec=${if (userHw) "auto" else "no"})"
-        },
-      )
+          "8-bit SDR → default path (hwdec=$hwLabel)"
+        }
+        DecoderPlan(
+          kind = StreamKind.SDR,
+          vo = if (userGpuNext) "gpu-next" else "gpu",
+          hwdec = hwLabel,
+          // Forced yuv420p is only safe-ish for 8-bit SDR compatibility cases.
+          forceYuv420p = userYuv,
+          toneMapping = null,
+          hdrComputePeak = null,
+          reason = sdrReason,
+        )
+      }
     }
   }
 
@@ -285,17 +315,19 @@ object AdaptiveDecoderSelector {
       }
     }
 
-    plan.toneMapping?.let {
+    val toneMapping = plan.toneMapping
+    if (toneMapping != null) {
       val cur = prop("tone-mapping")
-      if (cur != it) {
-        runCatching { MPVLib.setPropertyString("tone-mapping", it) }
+      if (cur != toneMapping) {
+        runCatching { MPVLib.setPropertyString("tone-mapping", toneMapping) }
         changed = true
       }
     }
-    plan.hdrComputePeak?.let {
+    val hdrPeak = plan.hdrComputePeak
+    if (hdrPeak != null) {
       val cur = prop("hdr-compute-peak")
-      if (cur != it) {
-        runCatching { MPVLib.setPropertyString("hdr-compute-peak", it) }
+      if (cur != hdrPeak) {
+        runCatching { MPVLib.setPropertyString("hdr-compute-peak", hdrPeak) }
         changed = true
       }
     }
@@ -308,6 +340,40 @@ object AdaptiveDecoderSelector {
       Log.d(TAG, "Adaptive decoder already matched: ${plan.kind} — ${plan.reason}")
     }
     return changed
+  }
+
+  /**
+   * Parse a profile number from codec/metadata text without Regex.
+   * Accepts forms like "profile 5", "profile=8", "p5", "P:5".
+   */
+  private fun parseProfileNumber(text: String): Long? {
+    val lower = text.lowercase()
+    val markers = listOf("profile", "p")
+    for (marker in markers) {
+      var start = 0
+      while (start < lower.length) {
+        val idx = lower.indexOf(marker, start)
+        if (idx < 0) break
+        var i = idx + marker.length
+        while (i < lower.length && (lower[i] == ' ' || lower[i] == '=' || lower[i] == ':' ||
+            lower[i] == '_' || lower[i] == '-' || lower[i] == '.')
+        ) {
+          i++
+        }
+        if (i < lower.length && lower[i].isDigit()) {
+          // Require marker boundary so bare "p" in "ipt" is not matched.
+          val beforeOk = idx == 0 || !lower[idx - 1].isLetterOrDigit()
+          if (beforeOk) {
+            var j = i
+            while (j < lower.length && lower[j].isDigit()) j++
+            val num = lower.substring(i, j).toLongOrNull()
+            if (num != null) return num
+          }
+        }
+        start = idx + marker.length
+      }
+    }
+    return null
   }
 
   private fun prop(name: String): String? = MPVLib.getPropertyString(name)?.takeIf { it.isNotBlank() }
