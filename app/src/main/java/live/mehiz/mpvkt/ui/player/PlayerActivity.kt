@@ -848,31 +848,38 @@ class PlayerActivity : AppCompatActivity() {
    * Re-runs if the stream signature changes (e.g. late gamma/DoVi props).
    */
   private fun maybeApplyAdaptiveDecoder(source: String): Boolean {
-    if (player.isExiting) return false
-    val info = runCatching { AdaptiveDecoderSelector.probeStreamInfo() }.getOrNull() ?: return false
-    if (!info.hasEnoughMetadata()) return false
-    val signature = listOf(
-      info.doviProfile?.toString().orEmpty(),
-      info.gamma,
-      info.pixfmt,
-      info.codec,
-      info.width?.toString().orEmpty(),
-      info.height?.toString().orEmpty(),
-      info.isProfile5.toString(),
-      info.isHdr.toString(),
-      info.isHighBitDepth.toString(),
-    ).joinToString("|")
-    if (adaptiveDecoderAppliedForFile && signature == lastAdaptiveDecoderSignature) {
-      return true
+    var ready = false
+    val info = if (player.isExiting) {
+      null
+    } else {
+      runCatching { AdaptiveDecoderSelector.probeStreamInfo() }.getOrNull()
     }
-    val ready = runCatching { player.applyAdaptiveDecoderIfNeeded() }.getOrDefault(false)
-    if (ready) {
-      adaptiveDecoderAppliedForFile = true
-      lastAdaptiveDecoderSignature = signature
-      Log.i(TAG, "Adaptive decoder via $source: $signature")
+    if (info?.hasEnoughMetadata() == true) {
+      val signature = adaptiveDecoderSignature(info)
+      ready = adaptiveDecoderAppliedForFile && signature == lastAdaptiveDecoderSignature
+      if (!ready) {
+        ready = runCatching { player.applyAdaptiveDecoderIfNeeded() }.getOrDefault(false)
+        if (ready) {
+          adaptiveDecoderAppliedForFile = true
+          lastAdaptiveDecoderSignature = signature
+          Log.i(TAG, "Adaptive decoder via $source: $signature")
+        }
+      }
     }
     return ready
   }
+
+  private fun adaptiveDecoderSignature(info: AdaptiveDecoderSelector.StreamInfo): String = listOf(
+    info.doviProfile?.toString().orEmpty(),
+    info.gamma,
+    info.pixfmt,
+    info.codec,
+    info.width?.toString().orEmpty(),
+    info.height?.toString().orEmpty(),
+    info.isProfile5.toString(),
+    info.isHdr.toString(),
+    info.isHighBitDepth.toString(),
+  ).joinToString("|")
 
   internal fun event(eventId: Int) {
     if (player.isExiting) return

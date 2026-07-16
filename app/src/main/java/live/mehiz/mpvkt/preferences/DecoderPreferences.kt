@@ -6,11 +6,14 @@ import live.mehiz.mpvkt.ui.player.Debanding
 
 class DecoderPreferences(preferenceStore: PreferenceStore) {
   val tryHWDecoding = preferenceStore.getBoolean("try_hw_dec", true)
+
   // gpu-next is required for correct Dolby Vision (esp. Profile 5 IPT) tonemapping.
   val gpuNext = preferenceStore.getBoolean("gpu_next", true)
+
   // Forced yuv420p strips high-bit-depth / non-YCbCr frames and can turn DV P5 green.
   // Keep available as an opt-in compatibility switch, but default off.
   val useYUV420P = preferenceStore.getBoolean("use_yuv420p", false)
+
   // Auto-fix DV Profile 5: force gpu-next, drop yuv420p, and fall back to software decode
   // so libplacebo can apply the IPT→display transform (mediacodec path often cannot).
   // Kept for backward compatibility; adaptive decoder supersedes this when enabled.

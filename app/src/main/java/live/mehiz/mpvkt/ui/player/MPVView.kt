@@ -110,15 +110,19 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
    *         (whether or not properties changed). false if metadata is not ready yet.
    */
   fun applyAdaptiveDecoderIfNeeded(): Boolean {
+    var ready = false
     if (decoderPreferences.adaptiveDecoder.get()) {
       val info = AdaptiveDecoderSelector.probeStreamInfo()
-      if (!info.hasEnoughMetadata()) return false
-      val plan = AdaptiveDecoderSelector.planFor(info, decoderPreferences)
-      AdaptiveDecoderSelector.applyPlan(plan)
-      return true
+      ready = info.hasEnoughMetadata()
+      if (ready) {
+        val plan = AdaptiveDecoderSelector.planFor(info, decoderPreferences)
+        AdaptiveDecoderSelector.applyPlan(plan)
+      }
+    } else {
+      // Legacy path: only touch DV Profile 5 streams.
+      ready = applyDolbyVisionProfile5FixIfNeeded()
     }
-    // Legacy path: only touch DV Profile 5 streams.
-    return applyDolbyVisionProfile5FixIfNeeded()
+    return ready
   }
 
   /**
@@ -129,16 +133,21 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
    * [DecoderPreferences.autoFixDolbyVision] is still on.
    */
   fun applyDolbyVisionProfile5FixIfNeeded(): Boolean {
-    if (!decoderPreferences.autoFixDolbyVision.get()) return false
-
-    val info = AdaptiveDecoderSelector.probeStreamInfo()
-    if (!info.hasEnoughMetadata()) return false
-    if (!info.isProfile5) {
-      restoreUserPixelFormatIfNeeded()
-      return true
+    var ready = false
+    if (decoderPreferences.autoFixDolbyVision.get()) {
+      val info = AdaptiveDecoderSelector.probeStreamInfo()
+      ready = info.hasEnoughMetadata()
+      when {
+        !ready -> Unit
+        !info.isProfile5 -> restoreUserPixelFormatIfNeeded()
+        else -> AdaptiveDecoderSelector.applyPlan(legacyDolbyVisionProfile5Plan())
+      }
     }
+    return ready
+  }
 
-    val plan = AdaptiveDecoderSelector.DecoderPlan(
+  private fun legacyDolbyVisionProfile5Plan(): AdaptiveDecoderSelector.DecoderPlan =
+    AdaptiveDecoderSelector.DecoderPlan(
       kind = AdaptiveDecoderSelector.StreamKind.DOLBY_VISION_P5,
       vo = "gpu-next",
       hwdec = "no",
@@ -147,9 +156,6 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
       hdrComputePeak = "yes",
       reason = "legacy DV P5 fix",
     )
-    AdaptiveDecoderSelector.applyPlan(plan)
-    return true
-  }
 
   fun isDolbyVisionProfile5(): Boolean =
     AdaptiveDecoderSelector.probeStreamInfo().isProfile5
