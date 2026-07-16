@@ -15,6 +15,7 @@ import live.mehiz.mpvkt.preferences.DecoderPreferences
  * Note: detection helpers avoid complex raw-string Regex inside property
  * getters — detekt 1.23.x can crash on those PSI ranges in CI.
  */
+@Suppress("TooManyFunctions")
 object AdaptiveDecoderSelector {
 
   data class StreamInfo(
