@@ -1,4 +1,4 @@
-@file:Suppress("ReturnCount", "ComplexCondition")
+@file:Suppress("ReturnCount", "ComplexCondition", "TooManyFunctions")
 
 package live.mehiz.mpvkt.network
 
