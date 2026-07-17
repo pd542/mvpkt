@@ -97,10 +97,19 @@ class SegmentedHttpCache(
       val direct = resolveDirectMediaUrl(originalUrl, userAgent, requestHeaders, systemProxy)
       if (!isAcceleratableUrl(direct)) {
         // Prefer resolved direct URL for mpv even when not multi-conn.
+        PlaybackSessionLog.i(
+          "SEG",
+          "not acceleratable url=${PlaybackSessionLog.redactUrl(direct)}",
+        )
         return@runCatching OpenResult(direct, false)
       }
       startSession(direct)
     }.getOrElse {
+      PlaybackSessionLog.e(
+        "SEG",
+        "open failed url=${PlaybackSessionLog.redactUrl(originalUrl)}",
+        it,
+      )
       shutdownQuietly(deleteCache = true)
       OpenResult(originalUrl, false)
     }
@@ -109,6 +118,11 @@ class SegmentedHttpCache(
   private fun startSession(mediaUrl: String): OpenResult {
     val probe = probe(mediaUrl, userAgent, requestHeaders, systemProxy)
     if (!probe.supportsRange || probe.contentLength < MIN_FILE_FOR_ACCEL) {
+      PlaybackSessionLog.i(
+        "SEG",
+        "probe skip range=${probe.supportsRange} len=${probe.contentLength} " +
+          "type=${probe.contentType} url=${PlaybackSessionLog.redactUrl(mediaUrl)}",
+      )
       return OpenResult(mediaUrl, false)
     }
 
@@ -140,8 +154,21 @@ class SegmentedHttpCache(
       log = {},
     )
 
+    PlaybackSessionLog.i(
+      "SEG",
+      "session start len=${probe.contentLength} conn=$connCount chunk=$chunk " +
+        "proxy=${systemProxy?.mpvHttpProxyUrl ?: "none"} " +
+        "url=${PlaybackSessionLog.redactUrl(probe.finalUrl)}",
+    )
     // Contiguous head before play — required for demux.
     val headOk = sess.downloadRangeBlocking(0L, headBytes - 1)
+    if (!headOk) {
+      PlaybackSessionLog.w(
+        "SEG",
+        "head download failed bytes=0-${headBytes - 1} " +
+          "url=${PlaybackSessionLog.redactUrl(probe.finalUrl)}",
+      )
+    }
     val have = sess.store.contiguousFrom(0L)
     if (!headOk || have < min(headBytes, MIN_HEAD_TO_START)) {
       sess.close(deleteCache = true)

@@ -139,6 +139,10 @@
     <string name="pref_advanced_input_conf">编辑 input.conf</string>
     <string name="pref_advanced_verbose_logging_title">详细日志</string>
     <string name="pref_advanced_verbose_logging_summary">有助于调试，但可能会影响性能</string>
+    <string name="pref_advanced_open_playback_logs">打开播放日志目录</string>
+    <string name="pref_advanced_open_playback_logs_summary">长视频卡断调试日志保存在 Android/data/…/files/playback-logs/</string>
+    <string name="pref_advanced_open_playback_logs_empty">还没有播放日志，请先播放一次视频</string>
+    <string name="pref_advanced_open_playback_logs_failed">无法打开日志目录</string>
     <string name="pref_advanced_clear_playback_history">清除播放历史</string>
     <string name="pref_advanced_clear_playback_history_confirm_title">确定清除播放历史吗？</string>
     <string name="pref_advanced_clear_playback_history_confirm_subtitle">这将清除所有之前播放过的媒体的播放位置、选定的字幕和音轨及其延迟和速度。</string>

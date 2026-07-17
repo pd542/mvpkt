@@ -57,6 +57,7 @@ import live.mehiz.mpvkt.database.entities.CustomButtonEntity
 import live.mehiz.mpvkt.database.entities.PlaybackStateEntity
 import live.mehiz.mpvkt.databinding.PlayerLayoutBinding
 import live.mehiz.mpvkt.domain.playbackstate.repository.PlaybackStateRepository
+import live.mehiz.mpvkt.network.PlaybackSessionLog
 import live.mehiz.mpvkt.network.SegmentedHttpCache
 import live.mehiz.mpvkt.network.SystemHttpProxy
 import live.mehiz.mpvkt.preferences.AdvancedPreferences
@@ -97,9 +98,12 @@ class PlayerActivity : AppCompatActivity() {
   private var segmentedHttpCache: SegmentedHttpCache? = null
   private var segmentedSourceUrl: String? = null
   private var segmentedWatchdogJob: kotlinx.coroutines.Job? = null
+  private var playbackLogHeartbeatJob: kotlinx.coroutines.Job? = null
   private var segmentedReconnectInProgress = false
   private var segmentedPendingSeek: Int? = null
   private var lastSegmentedReconnectAtMs = 0L
+  private var lastPausedForCache: Boolean? = null
+  private var lastEofReached: Boolean? = null
 
   /** Dedup adaptive decoder re-evaluation while video-params stream in. */
   private var adaptiveDecoderAppliedForFile = false
@@ -158,6 +162,8 @@ class PlayerActivity : AppCompatActivity() {
     setupMPV()
     setupAudio()
     setupMediaSession()
+    PlaybackSessionLog.startSession(applicationContext, reason = "PlayerActivity.onCreate")
+    startPlaybackLogHeartbeat()
     // Wipe any leftover segmented files from a previous process before opening a URL.
     clearSegmentedPlaybackCache()
     // Default path matches upstream: resolve URI and play immediately on main thread.
@@ -180,9 +186,14 @@ class PlayerActivity : AppCompatActivity() {
 
   private fun startPlayback(intent: Intent, useLoadfileCommand: Boolean) {
     val source = resolvePlayableUri(intent) ?: return
+    PlaybackSessionLog.i(
+      "PLAY",
+      "start source=${PlaybackSessionLog.redactUrl(source)} segmentedPref=${networkPreferences.multiConnectionDownload.get()}",
+    )
     // Multi-conn remains the default under system proxy (opt-in switch can disable it).
     // Origin Range downloads go through SystemHttpProxy; mpv only reads the local proxy.
     val wantSegmented = shouldUseSegmentedDownload(source)
+    PlaybackSessionLog.i("PLAY", "wantSegmented=$wantSegmented")
 
     if (!wantSegmented) {
       segmentedSourceUrl = null
@@ -196,11 +207,42 @@ class PlayerActivity : AppCompatActivity() {
     // On failure, open() already returns the original URL.
     lifecycleScope.launch {
       val playable = withContext(Dispatchers.IO) {
-        runCatching { maybeAccelerateHttp(source) }.getOrDefault(source)
+        runCatching { maybeAccelerateHttp(source) }.getOrElse {
+          PlaybackSessionLog.e("SEG", "maybeAccelerateHttp failed", it)
+          source
+        }
       }
+      PlaybackSessionLog.i(
+        "PLAY",
+        "playable=${PlaybackSessionLog.redactUrl(playable)} localProxy=${playable.isLocalSegmentedProxy()}",
+      )
       playUri(playable, useLoadfileCommand)
       if (playable.isLocalSegmentedProxy()) startSegmentedWatchdog() else stopSegmentedWatchdog()
     }
+  }
+
+  private fun startPlaybackLogHeartbeat() {
+    if (playbackLogHeartbeatJob?.isActive == true) return
+    playbackLogHeartbeatJob = lifecycleScope.launch {
+      while (!player.isExiting) {
+        delay(PlaybackSessionLog.HEARTBEAT_MS)
+        if (player.isExiting) return@launch
+        PlaybackSessionLog.snapshotPlayback("HEARTBEAT")
+        val snap = segmentedHttpCache?.snapshot()
+        if (snap != null) {
+          PlaybackSessionLog.i(
+            "SEG",
+            "heartbeat running=${snap.running} fully=${snap.fullyCached} " +
+              "downloaded=${snap.downloadedBytes}/${snap.totalSize} lastWriteAgeMs=${System.currentTimeMillis() - snap.lastWriteAtMs}",
+          )
+        }
+      }
+    }
+  }
+
+  private fun stopPlaybackLogHeartbeat() {
+    playbackLogHeartbeatJob?.cancel()
+    playbackLogHeartbeatJob = null
   }
 
   /** Detect Android system / NekoBox HTTP proxy when the preference allows it. */
@@ -253,6 +295,10 @@ class PlayerActivity : AppCompatActivity() {
   private fun playUri(uri: String, useLoadfileCommand: Boolean) {
     val isLocalProxy = uri.isLocalSegmentedProxy()
     applyMpvHttpProxyForUri(uri)
+    PlaybackSessionLog.i(
+      "PLAY",
+      "load uri=${PlaybackSessionLog.redactUrl(uri)} localProxy=$isLocalProxy useLoadfile=$useLoadfileCommand",
+    )
     // Local multi-conn proxy: always use loadfile so libmpv opens as network stream.
     if (useLoadfileCommand || isLocalProxy) {
       if (isLocalProxy) {
@@ -304,9 +350,19 @@ class PlayerActivity : AppCompatActivity() {
     return if (result.usedSegmented) {
       segmentedHttpCache = accelerator
       segmentedSourceUrl = uri
+      PlaybackSessionLog.i(
+        "SEG",
+        "opened multi-conn playPath=${PlaybackSessionLog.redactUrl(result.playPath)} " +
+          "src=${PlaybackSessionLog.redactUrl(uri)} connections=$connections chunkKb=$chunkKb " +
+          "proxy=${systemProxy?.mpvHttpProxyUrl ?: "none"}",
+      )
       result.playPath
     } else {
       accelerator.deleteCache()
+      PlaybackSessionLog.i(
+        "SEG",
+        "fallback direct (not segmented) src=${PlaybackSessionLog.redactUrl(uri)}",
+      )
       uri
     }
   }
@@ -350,6 +406,14 @@ class PlayerActivity : AppCompatActivity() {
         lastPlaybackProgressAtMs = state.now
       }
       if (!shouldReconnectSegmentedCache(state)) continue
+      PlaybackSessionLog.w(
+        "SEG",
+        "stall detected pos=$position duration=${state.duration} " +
+          "downloaded=${state.snapshot.downloadedBytes}/${state.snapshot.totalSize} " +
+          "lastWriteAgeMs=${state.now - state.snapshot.lastWriteAtMs} " +
+          "progressAgeMs=${state.now - state.lastPlaybackProgressAtMs}",
+      )
+      PlaybackSessionLog.snapshotPlayback("SEG-STALL")
       reconnectSegmentedCache(position ?: 0)
       lastSegmentedReconnectAtMs = state.now
       return
@@ -419,6 +483,10 @@ class PlayerActivity : AppCompatActivity() {
     segmentedReconnectInProgress = true
     segmentedWatchdogJob?.cancel()
     segmentedWatchdogJob = null
+    PlaybackSessionLog.w(
+      "SEG",
+      "reconnect begin pos=$position src=${PlaybackSessionLog.redactUrl(source)}",
+    )
     Toast.makeText(this, "网络卡住，正在重新连接", Toast.LENGTH_SHORT).show()
     lifecycleScope.launch {
       val oldCache = segmentedHttpCache
@@ -448,11 +516,19 @@ class PlayerActivity : AppCompatActivity() {
       val cache = reopened.first
       val playPath = reopened.second
       if (cache == null || playPath == null) {
+        PlaybackSessionLog.e(
+          "SEG",
+          "reconnect failed — multi-conn reopen unsuccessful src=${PlaybackSessionLog.redactUrl(source)}",
+        )
         segmentedSourceUrl = source
         segmentedReconnectInProgress = false
         startSegmentedWatchdog()
         return@launch
       }
+      PlaybackSessionLog.i(
+        "SEG",
+        "reconnect ok playPath=${PlaybackSessionLog.redactUrl(playPath)} seekTo=$position",
+      )
       segmentedHttpCache = cache
       segmentedSourceUrl = source
       segmentedPendingSeek = position
@@ -470,6 +546,7 @@ class PlayerActivity : AppCompatActivity() {
     }
     segmentedPendingSeek = null
     segmentedReconnectInProgress = false
+    PlaybackSessionLog.i("SEG", "post-reconnect seek absolute=$seekPosition")
     MPVLib.command("seek", seekPosition.toString(), "absolute+keyframes")
     startSegmentedWatchdog()
   }
@@ -479,6 +556,8 @@ class PlayerActivity : AppCompatActivity() {
 
   override fun onDestroy() {
     Log.d(TAG, "Exiting")
+    PlaybackSessionLog.snapshotPlayback("EXIT")
+    stopPlaybackLogHeartbeat()
     audioFocusRequest?.let {
       AudioManagerCompat.abandonAudioFocusRequest(audioManager, it)
     }
@@ -498,6 +577,7 @@ class PlayerActivity : AppCompatActivity() {
     MPVLib.destroy()
     // Always wipe segmented multi-conn data when leaving the player.
     clearSegmentedPlaybackCache()
+    PlaybackSessionLog.endSession(reason = "PlayerActivity.onDestroy finishing=$isFinishing")
 
     super.onDestroy()
   }
@@ -884,12 +964,36 @@ class PlayerActivity : AppCompatActivity() {
   internal fun onObserverEvent(property: String, value: Boolean) {
     if (player.isExiting) return
     when (property) {
-      "pause" if value -> window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-      "pause" -> window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+      "pause" if value -> {
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        PlaybackSessionLog.i("MPV", "pause=true")
+        PlaybackSessionLog.snapshotPlayback("PAUSE")
+      }
+      "pause" -> {
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        PlaybackSessionLog.i("MPV", "pause=false")
+      }
+      "paused-for-cache" -> {
+        if (lastPausedForCache != value) {
+          lastPausedForCache = value
+          if (value) {
+            PlaybackSessionLog.w("MPV", "paused-for-cache=true (buffering / may stall)")
+            PlaybackSessionLog.snapshotPlayback("BUFFER")
+          } else {
+            PlaybackSessionLog.i("MPV", "paused-for-cache=false (buffer recovered)")
+          }
+        }
+      }
       "eof-reached" if value -> {
+        if (lastEofReached != true) {
+          lastEofReached = true
+          PlaybackSessionLog.w("MPV", "eof-reached=true")
+          PlaybackSessionLog.snapshotPlayback("EOF")
+        }
         clearSegmentedPlaybackCache()
         if (playerPreferences.closeAfterReachingEndOfVideo.get()) finishAndRemoveTask()
       }
+      "eof-reached" -> lastEofReached = value
     }
   }
 
@@ -959,6 +1063,11 @@ class PlayerActivity : AppCompatActivity() {
   internal fun event(eventId: Int) {
     if (player.isExiting) return
     when (eventId) {
+      MPVLib.mpvEventId.MPV_EVENT_START_FILE -> {
+        PlaybackSessionLog.i("MPV", "event=START_FILE")
+        lastEofReached = false
+      }
+
       MPVLib.mpvEventId.MPV_EVENT_FILE_LOADED -> {
         fileName = getFileName(intent)
         setIntentExtras(intent.extras)
@@ -966,6 +1075,11 @@ class PlayerActivity : AppCompatActivity() {
         if (mediaTitle.isNullOrBlank() || mediaTitle.isDigitsOnly()) {
           MPVLib.setPropertyString("media-title", fileName)
         }
+        PlaybackSessionLog.i(
+          "MPV",
+          "event=FILE_LOADED title=$fileName mediaTitle=$mediaTitle",
+        )
+        PlaybackSessionLog.snapshotPlayback("FILE_LOADED")
         lifecycleScope.launch(Dispatchers.IO) {
           loadVideoPlaybackState(fileName)
         }
@@ -988,7 +1102,33 @@ class PlayerActivity : AppCompatActivity() {
         }
       }
 
-      MPVLib.mpvEventId.MPV_EVENT_PLAYBACK_RESTART -> player.isExiting = false
+      MPVLib.mpvEventId.MPV_EVENT_END_FILE -> {
+        PlaybackSessionLog.w("MPV", "event=END_FILE")
+        PlaybackSessionLog.snapshotPlayback("END_FILE")
+      }
+
+      MPVLib.mpvEventId.MPV_EVENT_IDLE -> {
+        PlaybackSessionLog.w("MPV", "event=IDLE")
+        PlaybackSessionLog.snapshotPlayback("IDLE")
+      }
+
+      MPVLib.mpvEventId.MPV_EVENT_SEEK -> {
+        PlaybackSessionLog.d("MPV", "event=SEEK")
+      }
+
+      MPVLib.mpvEventId.MPV_EVENT_PLAYBACK_RESTART -> {
+        player.isExiting = false
+        PlaybackSessionLog.i("MPV", "event=PLAYBACK_RESTART")
+        PlaybackSessionLog.snapshotPlayback("RESTART")
+      }
+
+      MPVLib.mpvEventId.MPV_EVENT_SHUTDOWN -> {
+        PlaybackSessionLog.w("MPV", "event=SHUTDOWN")
+      }
+
+      MPVLib.mpvEventId.MPV_EVENT_QUEUE_OVERFLOW -> {
+        PlaybackSessionLog.e("MPV", "event=QUEUE_OVERFLOW")
+      }
     }
   }
 

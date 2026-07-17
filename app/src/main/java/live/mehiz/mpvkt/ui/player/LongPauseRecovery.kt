@@ -3,6 +3,7 @@ package live.mehiz.mpvkt.ui.player
 import android.os.SystemClock
 import android.util.Log
 import `is`.xyz.mpv.MPVLib
+import live.mehiz.mpvkt.network.PlaybackSessionLog
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 
@@ -38,6 +39,11 @@ object LongPauseRecovery {
   fun recoverIfNeeded() {
     val recovery = resolveRecovery() ?: return
     Log.i(TAG, "Long-pause recovery after ${recovery.idleMs}ms pos=${recovery.pos} path=${recovery.path}")
+    PlaybackSessionLog.w(
+      "RECOVERY",
+      "long-pause seek idleMs=${recovery.idleMs} pos=${recovery.pos} " +
+        "path=${PlaybackSessionLog.redactUrl(recovery.path)}",
+    )
     runCatching {
       MPVLib.command(
         "seek",
@@ -46,6 +52,7 @@ object LongPauseRecovery {
       )
     }.onFailure {
       Log.w(TAG, "Long-pause seek recovery failed: ${it.message}")
+      PlaybackSessionLog.e("RECOVERY", "long-pause seek failed", it)
     }
   }
 

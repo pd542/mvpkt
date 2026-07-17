@@ -354,6 +354,8 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
     "video-params/pixelformat" to MPVLib.mpvFormat.MPV_FORMAT_STRING,
     "video-codec" to MPVLib.mpvFormat.MPV_FORMAT_STRING,
     "eof-reached" to MPVLib.mpvFormat.MPV_FORMAT_FLAG,
+    // Used by playback session log to detect mid-stream stalls / buffering.
+    "paused-for-cache" to MPVLib.mpvFormat.MPV_FORMAT_FLAG,
 
     "user-data/mpvkt/show_text" to MPVLib.mpvFormat.MPV_FORMAT_STRING,
     "user-data/mpvkt/toggle_ui" to MPVLib.mpvFormat.MPV_FORMAT_STRING,

@@ -42,6 +42,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import live.mehiz.mpvkt.R
 import live.mehiz.mpvkt.database.MpvKtDatabase
+import live.mehiz.mpvkt.network.PlaybackSessionLog
 import live.mehiz.mpvkt.preferences.AdvancedPreferences
 import live.mehiz.mpvkt.preferences.preference.collectAsState
 import live.mehiz.mpvkt.presentation.Screen
@@ -53,6 +54,7 @@ import me.zhanghai.compose.preference.SwitchPreference
 import me.zhanghai.compose.preference.TextFieldPreference
 import me.zhanghai.compose.preference.TwoTargetIconButtonPreference
 import org.koin.compose.koinInject
+import androidx.core.content.FileProvider
 import java.io.File
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.outputStream
@@ -216,6 +218,13 @@ object AdvancedPreferencesScreen : Screen {
             title = { Text(stringResource(R.string.pref_advanced_verbose_logging_title)) },
             summary = { Text(stringResource(R.string.pref_advanced_verbose_logging_summary)) },
           )
+          Preference(
+            title = { Text(stringResource(R.string.pref_advanced_open_playback_logs)) },
+            summary = { Text(stringResource(R.string.pref_advanced_open_playback_logs_summary)) },
+            onClick = {
+              openPlaybackLogsFolder(context)
+            },
+          )
           var isConfirmDialogShown by remember { mutableStateOf(false) }
           val mpvKtDatabase = koinInject<MpvKtDatabase>()
           Preference(
@@ -268,4 +277,45 @@ object AdvancedPreferencesScreen : Screen {
 
 fun getSimplifiedPathFromUri(uri: String): String {
   return Environment.getExternalStorageDirectory().canonicalPath + "/" + Uri.decode(uri).substringAfterLast(":")
+}
+
+private fun openPlaybackLogsFolder(context: android.content.Context) {
+  val dir = PlaybackSessionLog.logDir(context).also { it.mkdirs() }
+  val latest = dir.listFiles { f -> f.isFile && f.name.startsWith("mpvkt-playback-") }
+    ?.maxByOrNull { it.lastModified() }
+  if (latest == null) {
+    Toast.makeText(
+      context,
+      context.getString(R.string.pref_advanced_open_playback_logs_empty),
+      Toast.LENGTH_LONG,
+    ).show()
+    return
+  }
+  runCatching {
+    val uri = FileProvider.getUriForFile(
+      context,
+      context.packageName + ".provider",
+      latest,
+    )
+    val intent = Intent(Intent.ACTION_SEND).apply {
+      type = "text/plain"
+      putExtra(Intent.EXTRA_STREAM, uri)
+      putExtra(Intent.EXTRA_SUBJECT, latest.name)
+      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(
+      Intent.createChooser(
+        intent,
+        context.getString(R.string.pref_advanced_open_playback_logs),
+      ),
+    )
+    Toast.makeText(context, latest.absolutePath, Toast.LENGTH_LONG).show()
+  }.onFailure {
+    Toast.makeText(
+      context,
+      context.getString(R.string.pref_advanced_open_playback_logs_failed) +
+        ": ${latest.absolutePath}",
+      Toast.LENGTH_LONG,
+    ).show()
+  }
 }

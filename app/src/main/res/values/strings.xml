@@ -175,6 +175,10 @@
     <string name="pref_advanced_input_conf">Edit input.conf</string>
     <string name="pref_advanced_verbose_logging_title">Verbose logging</string>
     <string name="pref_advanced_verbose_logging_summary">Helps in debugging but may hinder performance</string>
+    <string name="pref_advanced_open_playback_logs">Open playback log folder</string>
+    <string name="pref_advanced_open_playback_logs_summary">Session logs for long-play stalls are saved under Android/data/…/files/playback-logs/</string>
+    <string name="pref_advanced_open_playback_logs_empty">No playback logs yet. Play a video first.</string>
+    <string name="pref_advanced_open_playback_logs_failed">Could not open log folder</string>
     <string name="pref_advanced_clear_playback_history">Clear playback history</string>
     <string name="pref_advanced_clear_playback_history_confirm_title">Are you sure you want to clear your playback history?</string>
     <string name="pref_advanced_clear_playback_history_confirm_subtitle">This will clear all your previous media\'s playback positions, selected subtitles and audio tracks along with their delays and speeds</string>
