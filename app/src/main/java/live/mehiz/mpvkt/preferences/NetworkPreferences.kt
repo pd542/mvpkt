@@ -78,10 +78,11 @@ class NetworkPreferences(preferenceStore: PreferenceStore) {
   val optimizeForNetwork = preferenceStore.getBoolean("network_optimize_for_streaming", false)
 
   /**
-   * Prefer highest HLS/DASH bandwidth ladder entry when available.
-   * Default off — can break some adaptive streams.
+   * Prefer highest quality for adaptive HLS/DASH **and** Emby/Jellyfin streams.
+   * For Emby, rewrites low VideoBitrate/transcode URLs toward Static original play.
+   * Default on — low-bitrate Emby ladders look like "blurry" playback otherwise.
    */
-  val preferHighestBandwidth = preferenceStore.getBoolean("network_prefer_highest_bandwidth", false)
+  val preferHighestBandwidth = preferenceStore.getBoolean("network_prefer_highest_bandwidth_v2", true)
 
   /** Keep demuxer cache seekable for smoother seeking on network streams. */
   val demuxerSeekableCache = preferenceStore.getBoolean("network_demuxer_seekable_cache", true)
