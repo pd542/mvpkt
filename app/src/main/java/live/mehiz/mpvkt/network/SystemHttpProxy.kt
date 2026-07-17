@@ -1,3 +1,5 @@
+@file:Suppress("ReturnCount", "ComplexCondition")
+
 package live.mehiz.mpvkt.network
 
 import android.content.Context
@@ -38,19 +40,10 @@ object SystemHttpProxy {
     val exclusionList: List<String>,
   ) {
     fun shouldBypass(url: String): Boolean {
-      val host = runCatching { URI(url).host }.getOrNull()?.lowercase(Locale.US) ?: return false
-      if (host == "localhost" || host == "127.0.0.1" || host == "::1" || host.endsWith(".local")) {
-        return true
-      }
-      return exclusionList.any { rule ->
-        val r = rule.lowercase(Locale.US).trim()
-        if (r.isEmpty()) return@any false
-        if (r.startsWith("*.")) {
-          host.endsWith(r.removePrefix("*")) || host == r.removePrefix("*.")
-        } else {
-          host == r || host.endsWith(".$r")
-        }
-      }
+      val host = runCatching { URI(url).host }.getOrNull()?.lowercase(Locale.US)
+        ?: return false
+      if (isLoopbackOrLocalHost(host)) return true
+      return matchesExclusion(host, exclusionList)
     }
   }
 
@@ -59,18 +52,7 @@ object SystemHttpProxy {
    * Transparent — app sockets should stay "direct"; the OS routes them.
    */
   fun isVpnActive(context: Context): Boolean {
-    return runCatching {
-      val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE)
-        as? ConnectivityManager ?: return false
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-        val network = cm.activeNetwork ?: return false
-        val caps = cm.getNetworkCapabilities(network) ?: return false
-        caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
-      } else {
-        @Suppress("DEPRECATION")
-        cm.activeNetworkInfo?.type == ConnectivityManager.TYPE_VPN
-      }
-    }.getOrDefault(false)
+    return runCatching { detectVpn(context) }.getOrDefault(false)
   }
 
   /**
@@ -85,41 +67,43 @@ object SystemHttpProxy {
       Log.d(TAG, "VPN active — skip app-layer HTTP proxy (transparent)")
       return null
     }
-    val fromConnectivity = fromConnectivityManager(context)
-    if (fromConnectivity != null) return fromConnectivity
-    return fromSystemProperties()
+    return fromConnectivityManager(context) ?: fromSystemProperties()
   }
 
   fun isActive(context: Context): Boolean = current(context) != null
 
+  private fun detectVpn(context: Context): Boolean {
+    val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE)
+      as? ConnectivityManager ?: return false
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+      val network = cm.activeNetwork ?: return false
+      val caps = cm.getNetworkCapabilities(network) ?: return false
+      caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+    } else {
+      @Suppress("DEPRECATION")
+      cm.activeNetworkInfo?.type == ConnectivityManager.TYPE_VPN
+    }
+  }
+
   private fun fromConnectivityManager(context: Context): Info? {
     return runCatching {
-      val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-        ?: return null
-      val proxy: ProxyInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-        cm.defaultProxy
-      } else {
-        @Suppress("DEPRECATION")
-        android.net.Proxy.getDefaultHost()?.let { host ->
-          @Suppress("DEPRECATION")
-          val port = android.net.Proxy.getDefaultPort()
-          if (port > 0) ProxyInfo.buildDirectProxy(host, port) else null
-        }
-      } ?: return null
-
-      val host = proxy.host?.trim().orEmpty()
-      val port = proxy.port
-      if (host.isEmpty() || port <= 0 || port > 65535) return null
-      // PAC-only without host is not usable for libmpv's simple http-proxy.
-      val excl = proxy.exclusionList?.toList().orEmpty()
-      Info(
-        host = host,
-        port = port,
-        mpvHttpProxyUrl = "http://$host:$port",
-        javaProxy = Proxy(Proxy.Type.HTTP, InetSocketAddress(host, port)),
-        exclusionList = excl,
-      ).also { Log.d(TAG, "system proxy ${it.mpvHttpProxyUrl} excl=$excl") }
+      val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE)
+        as? ConnectivityManager
+      val proxy = cm?.let { readDefaultProxy(it) } ?: return@runCatching null
+      buildInfo(proxy.host?.trim().orEmpty(), proxy.port, proxy.exclusionList?.toList().orEmpty())
     }.getOrNull()
+  }
+
+  private fun readDefaultProxy(cm: ConnectivityManager): ProxyInfo? {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+      cm.defaultProxy
+    } else {
+      @Suppress("DEPRECATION")
+      val host = android.net.Proxy.getDefaultHost()
+      @Suppress("DEPRECATION")
+      val port = android.net.Proxy.getDefaultPort()
+      if (!host.isNullOrBlank() && port > 0) ProxyInfo.buildDirectProxy(host, port) else null
+    }
   }
 
   private fun fromSystemProperties(): Info? {
@@ -128,19 +112,40 @@ object SystemHttpProxy {
     val port = (
       System.getProperty("http.proxyPort")
         ?: System.getProperty("https.proxyPort")
-      )?.toIntOrNull() ?: return null
-    if (host.isEmpty() || port <= 0) return null
+      )?.toIntOrNull()
     val excl = System.getProperty("http.nonProxyHosts")
       ?.split("|", ",", ";")
       ?.map { it.trim() }
       ?.filter { it.isNotEmpty() }
       .orEmpty()
+    return buildInfo(host, port ?: 0, excl)
+  }
+
+  private fun buildInfo(host: String, port: Int, exclusionList: List<String>): Info? {
+    if (host.isEmpty() || port <= 0 || port > 65535) return null
     return Info(
       host = host,
       port = port,
       mpvHttpProxyUrl = "http://$host:$port",
       javaProxy = Proxy(Proxy.Type.HTTP, InetSocketAddress(host, port)),
-      exclusionList = excl,
-    )
+      exclusionList = exclusionList,
+    ).also { Log.d(TAG, "system proxy ${it.mpvHttpProxyUrl} excl=$exclusionList") }
+  }
+
+  private fun isLoopbackOrLocalHost(host: String): Boolean =
+    host == "localhost" || host == "127.0.0.1" || host == "::1" || host.endsWith(".local")
+
+  private fun matchesExclusion(host: String, exclusionList: List<String>): Boolean {
+    return exclusionList.any { rule ->
+      val r = rule.lowercase(Locale.US).trim()
+      when {
+        r.isEmpty() -> false
+        r.startsWith("*.") -> {
+          val suffix = r.removePrefix("*")
+          host.endsWith(suffix) || host == r.removePrefix("*.")
+        }
+        else -> host == r || host.endsWith(".$r")
+      }
+    }
   }
 }

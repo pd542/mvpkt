@@ -216,14 +216,14 @@ class PlayerActivity : AppCompatActivity() {
    * pure system HTTP proxy is active (not VPN transparent mode).
    */
   private fun shouldUseSegmentedDownload(source: String): Boolean {
-    if (!networkPreferences.multiConnectionDownload.get()) return false
-    if (!SegmentedHttpCache.shouldTryAccelerate(source)) return false
+    val multiEnabled = networkPreferences.multiConnectionDownload.get()
+    val acceleratable = SegmentedHttpCache.shouldTryAccelerate(source)
     val proxy = resolveSystemHttpProxy()
-    if (proxy != null && networkPreferences.disableMultiConnUnderProxy.get()) {
-      Log.i(TAG, "skip multi-conn under system proxy ${proxy.mpvHttpProxyUrl}")
-      return false
+    val blockedByProxy = proxy != null && networkPreferences.disableMultiConnUnderProxy.get()
+    proxy?.takeIf { blockedByProxy }?.let {
+      Log.i(TAG, "skip multi-conn under system proxy ${it.mpvHttpProxyUrl}")
     }
-    return true
+    return multiEnabled && acceleratable && !blockedByProxy
   }
 
   /**
