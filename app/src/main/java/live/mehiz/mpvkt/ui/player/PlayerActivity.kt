@@ -186,9 +186,10 @@ class PlayerActivity : AppCompatActivity() {
 
   private fun startPlayback(intent: Intent, useLoadfileCommand: Boolean) {
     val source = resolvePlayableUri(intent) ?: return
+    val multiPref = networkPreferences.multiConnectionDownload.get()
     PlaybackSessionLog.i(
       "PLAY",
-      "start source=${PlaybackSessionLog.redactUrl(source)} segmentedPref=${networkPreferences.multiConnectionDownload.get()}",
+      "start source=${PlaybackSessionLog.redactUrl(source)} segmentedPref=$multiPref",
     )
     // Multi-conn remains the default under system proxy (opt-in switch can disable it).
     // Origin Range downloads go through SystemHttpProxy; mpv only reads the local proxy.
@@ -230,10 +231,12 @@ class PlayerActivity : AppCompatActivity() {
         PlaybackSessionLog.snapshotPlayback("HEARTBEAT")
         val snap = segmentedHttpCache?.snapshot()
         if (snap != null) {
+          val writeAgeMs = System.currentTimeMillis() - snap.lastWriteAtMs
           PlaybackSessionLog.i(
             "SEG",
             "heartbeat running=${snap.running} fully=${snap.fullyCached} " +
-              "downloaded=${snap.downloadedBytes}/${snap.totalSize} lastWriteAgeMs=${System.currentTimeMillis() - snap.lastWriteAtMs}",
+              "downloaded=${snap.downloadedBytes}/${snap.totalSize} " +
+              "lastWriteAgeMs=$writeAgeMs",
           )
         }
       }
@@ -1067,67 +1070,58 @@ class PlayerActivity : AppCompatActivity() {
         PlaybackSessionLog.i("MPV", "event=START_FILE")
         lastEofReached = false
       }
-
-      MPVLib.mpvEventId.MPV_EVENT_FILE_LOADED -> {
-        fileName = getFileName(intent)
-        setIntentExtras(intent.extras)
-        val mediaTitle = MPVLib.getPropertyString("media-title")
-        if (mediaTitle.isNullOrBlank() || mediaTitle.isDigitsOnly()) {
-          MPVLib.setPropertyString("media-title", fileName)
-        }
-        PlaybackSessionLog.i(
-          "MPV",
-          "event=FILE_LOADED title=$fileName mediaTitle=$mediaTitle",
-        )
-        PlaybackSessionLog.snapshotPlayback("FILE_LOADED")
-        lifecycleScope.launch(Dispatchers.IO) {
-          loadVideoPlaybackState(fileName)
-        }
-        onSegmentedReloaded()
-        setOrientation()
-        viewModel.changeVideoAspect(playerPreferences.videoAspect.get())
-        adaptiveDecoderAppliedForFile = false
-        lastAdaptiveDecoderSignature = null
-        // Pick vo/hwdec/vf/tone-mapping from the loaded stream (DV/HDR/SDR…).
-        // video-params may populate slightly after FILE_LOADED; retry a few times.
-        lifecycleScope.launch {
-          repeat(8) { attempt ->
-            if (player.isExiting) return@launch
-            if (maybeApplyAdaptiveDecoder("file-loaded#$attempt")) return@launch
-            delay(200L * (attempt + 1))
-          }
-          if (!adaptiveDecoderAppliedForFile) {
-            Log.w(TAG, "Adaptive decoder: stream metadata not ready after retries")
-          }
-        }
-      }
-
-      MPVLib.mpvEventId.MPV_EVENT_END_FILE -> {
-        PlaybackSessionLog.w("MPV", "event=END_FILE")
-        PlaybackSessionLog.snapshotPlayback("END_FILE")
-      }
-
-      MPVLib.mpvEventId.MPV_EVENT_IDLE -> {
-        PlaybackSessionLog.w("MPV", "event=IDLE")
-        PlaybackSessionLog.snapshotPlayback("IDLE")
-      }
-
-      MPVLib.mpvEventId.MPV_EVENT_SEEK -> {
-        PlaybackSessionLog.d("MPV", "event=SEEK")
-      }
-
+      MPVLib.mpvEventId.MPV_EVENT_FILE_LOADED -> onFileLoadedEvent()
+      MPVLib.mpvEventId.MPV_EVENT_END_FILE -> logMpvLifecycle("END_FILE", warn = true)
+      MPVLib.mpvEventId.MPV_EVENT_IDLE -> logMpvLifecycle("IDLE", warn = true)
+      MPVLib.mpvEventId.MPV_EVENT_SEEK -> PlaybackSessionLog.d("MPV", "event=SEEK")
       MPVLib.mpvEventId.MPV_EVENT_PLAYBACK_RESTART -> {
         player.isExiting = false
-        PlaybackSessionLog.i("MPV", "event=PLAYBACK_RESTART")
-        PlaybackSessionLog.snapshotPlayback("RESTART")
+        logMpvLifecycle("PLAYBACK_RESTART", snapshotTag = "RESTART")
       }
-
-      MPVLib.mpvEventId.MPV_EVENT_SHUTDOWN -> {
-        PlaybackSessionLog.w("MPV", "event=SHUTDOWN")
-      }
-
+      MPVLib.mpvEventId.MPV_EVENT_SHUTDOWN -> PlaybackSessionLog.w("MPV", "event=SHUTDOWN")
       MPVLib.mpvEventId.MPV_EVENT_QUEUE_OVERFLOW -> {
         PlaybackSessionLog.e("MPV", "event=QUEUE_OVERFLOW")
+      }
+    }
+  }
+
+  private fun logMpvLifecycle(
+    eventName: String,
+    warn: Boolean = false,
+    snapshotTag: String = eventName,
+  ) {
+    if (warn) {
+      PlaybackSessionLog.w("MPV", "event=$eventName")
+    } else {
+      PlaybackSessionLog.i("MPV", "event=$eventName")
+    }
+    PlaybackSessionLog.snapshotPlayback(snapshotTag)
+  }
+
+  private fun onFileLoadedEvent() {
+    fileName = getFileName(intent)
+    setIntentExtras(intent.extras)
+    val mediaTitle = MPVLib.getPropertyString("media-title")
+    if (mediaTitle.isNullOrBlank() || mediaTitle.isDigitsOnly()) {
+      MPVLib.setPropertyString("media-title", fileName)
+    }
+    PlaybackSessionLog.i("MPV", "event=FILE_LOADED title=$fileName mediaTitle=$mediaTitle")
+    PlaybackSessionLog.snapshotPlayback("FILE_LOADED")
+    lifecycleScope.launch(Dispatchers.IO) { loadVideoPlaybackState(fileName) }
+    onSegmentedReloaded()
+    setOrientation()
+    viewModel.changeVideoAspect(playerPreferences.videoAspect.get())
+    adaptiveDecoderAppliedForFile = false
+    lastAdaptiveDecoderSignature = null
+    // video-params may populate slightly after FILE_LOADED; retry a few times.
+    lifecycleScope.launch {
+      repeat(8) { attempt ->
+        if (player.isExiting) return@launch
+        if (maybeApplyAdaptiveDecoder("file-loaded#$attempt")) return@launch
+        delay(200L * (attempt + 1))
+      }
+      if (!adaptiveDecoderAppliedForFile) {
+        Log.w(TAG, "Adaptive decoder: stream metadata not ready after retries")
       }
     }
   }
