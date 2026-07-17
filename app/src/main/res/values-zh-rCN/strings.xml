@@ -113,7 +113,7 @@
     <string name="pref_network_tls_verify">校验证书（TLS）</string>
     <string name="pref_network_tls_verify_summary">仅在自签名证书或本地 MITM 代理（如 NekoBox HTTPS 解密）时关闭</string>
     <string name="pref_network_use_system_http_proxy">使用系统 HTTP 代理</string>
-    <string name="pref_network_use_system_http_proxy_summary">把 Android 系统代理（NekoBox / Clash 系统代理模式）传给 libmpv 与多连接下载。TUN/VPN 透明代理无需设置。</string>
+    <string name="pref_network_use_system_http_proxy_summary">把 Android 系统 HTTP 代理（NekoBox / Clash 系统代理模式）传给 libmpv 与多连接下载。全局 VPN/TUN 为透明代理，不会再套一层 HTTP 代理。无代理时保持直连。</string>
     <string name="pref_network_disable_multi_conn_under_proxy">代理下关闭多连接</string>
     <string name="pref_network_disable_multi_conn_under_proxy_summary">检测到系统 HTTP 代理时，跳过分片多连接，改用单连接直连播放。默认关闭；仅在 NekoBox 等代理把并发 Range 卡死时再打开。</string>
     <string name="pref_network_tip_title">关于缓存速度</string>

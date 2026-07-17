@@ -59,9 +59,10 @@ class NetworkPreferences(preferenceStore: PreferenceStore) {
   val tlsVerify = preferenceStore.getBoolean("network_tls_verify", true)
 
   /**
-   * Forward Android system HTTP(S) proxy (NekoBox / Clash system-proxy mode, etc.)
+   * Forward Android system HTTP(S) proxy (NekoBox / Clash **system-proxy** mode)
    * into libmpv `http-proxy` and Java multi-conn downloads.
-   * TUN/VPN transparent mode has no ProxyInfo and needs no setting.
+   * Global VPN/TUN is transparent: never double-proxied even if a local mixed port exists.
+   * With no proxy configured, traffic stays direct.
    */
   val useSystemHttpProxy = preferenceStore.getBoolean("network_use_system_http_proxy", true)
 

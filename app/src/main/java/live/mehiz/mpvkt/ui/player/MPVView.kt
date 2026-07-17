@@ -267,9 +267,10 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
   /**
    * Wire Android system HTTP(S) proxy into libmpv as a default for remote URLs.
    *
-   * NekoBox "HTTP 代理 / 系统代理" 模式会设置 [android.net.ProxyInfo]；
-   * TUN 透明代理没有 ProxyInfo，流量会在系统层自动接管，无需这里处理。
-   * 播放本地 127.0.0.1 分片代理时，PlayerActivity 会在 loadfile 前清空 http-proxy。
+   * - NekoBox **系统 HTTP 代理**：有 [android.net.ProxyInfo] → 写入 `http-proxy`
+   * - NekoBox **全局 VPN/TUN**：透明路由，[SystemHttpProxy.current] 返回 null，不套 HTTP 代理
+   * - 无代理：`http-proxy` 置空，默认直连
+   * - 本地 127.0.0.1 分片：PlayerActivity 会在 loadfile 前清空 http-proxy
    */
   private fun applySystemHttpProxyIfPresent() {
     if (!networkPreferences.useSystemHttpProxy.get()) {

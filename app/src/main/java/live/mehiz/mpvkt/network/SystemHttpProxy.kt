@@ -2,6 +2,7 @@ package live.mehiz.mpvkt.network
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.ProxyInfo
 import android.os.Build
 import android.util.Log
@@ -11,13 +12,19 @@ import java.net.URI
 import java.util.Locale
 
 /**
- * Detect Android system / VPN HTTP(S) proxy (e.g. NekoBox "HTTP proxy" / system proxy).
+ * Detect Android system / VPN networking for playback.
  *
- * Notes:
- * - VPN TUN mode usually has no [ProxyInfo]; traffic is transparent at IP layer.
- * - System HTTP proxy mode is what libmpv does **not** pick up by itself — callers
- *   must pass [mpvHttpProxyUrl] into mpv's `http-proxy` option.
- * - Localhost must never be forced through this proxy (breaks 127.0.0.1 multi-conn).
+ * Two different modes must not be mixed:
+ * - **VPN / TUN (NekoBox 全局 VPN)**: traffic is already transparent at the IP layer.
+ *   There is usually no useful app-layer HTTP proxy, or NekoBox may still expose a
+ *   local mixed-port [ProxyInfo]. Injecting that into libmpv as `http-proxy` would
+ *   **double-hop** and break Emby / media-server streams. Callers must treat VPN as
+ *   "application direct connect".
+ * - **System HTTP proxy only** (no VPN): libmpv does not read [ProxyInfo] by itself —
+ *   callers pass [Info.mpvHttpProxyUrl] into mpv's `http-proxy`.
+ * - **No proxy / no VPN**: always direct (`http-proxy` empty, Java sockets without Proxy).
+ *
+ * Localhost must never be forced through an HTTP proxy (breaks 127.0.0.1 multi-conn).
  */
 object SystemHttpProxy {
   private const val TAG = "SystemHttpProxy"
@@ -47,7 +54,37 @@ object SystemHttpProxy {
     }
   }
 
+  /**
+   * True when an active network is a VPN (NekoBox / Clash TUN 全局代理, system VPN, etc.).
+   * Transparent — app sockets should stay "direct"; the OS routes them.
+   */
+  fun isVpnActive(context: Context): Boolean {
+    return runCatching {
+      val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE)
+        as? ConnectivityManager ?: return false
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        val network = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+      } else {
+        @Suppress("DEPRECATION")
+        cm.activeNetworkInfo?.type == ConnectivityManager.TYPE_VPN
+      }
+    }.getOrDefault(false)
+  }
+
+  /**
+   * App-layer HTTP(S) proxy only.
+   * Returns null when:
+   * - preference callers skip us,
+   * - no system proxy is configured,
+   * - **or a VPN is active** (transparent mode — do not double-proxy).
+   */
   fun current(context: Context): Info? {
+    if (isVpnActive(context)) {
+      Log.d(TAG, "VPN active — skip app-layer HTTP proxy (transparent)")
+      return null
+    }
     val fromConnectivity = fromConnectivityManager(context)
     if (fromConnectivity != null) return fromConnectivity
     return fromSystemProperties()
@@ -74,9 +111,6 @@ object SystemHttpProxy {
       val port = proxy.port
       if (host.isEmpty() || port <= 0 || port > 65535) return null
       // PAC-only without host is not usable for libmpv's simple http-proxy.
-      if (host.equals("localhost", true) || host == "127.0.0.1") {
-        // Some clients publish a local mixed-port proxy — still valid.
-      }
       val excl = proxy.exclusionList?.toList().orEmpty()
       Info(
         host = host,

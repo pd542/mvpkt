@@ -148,7 +148,7 @@
     <string name="pref_network_tls_verify">Verify TLS certificates</string>
     <string name="pref_network_tls_verify_summary">Disable only if your stream uses a self-signed certificate or a local MITM proxy (e.g. NekoBox HTTPS inspect)</string>
     <string name="pref_network_use_system_http_proxy">Use system HTTP proxy</string>
-    <string name="pref_network_use_system_http_proxy_summary">Forward Android system proxy (NekoBox / Clash system-proxy mode) into libmpv and multi-conn downloads. TUN/VPN transparent mode needs no setting.</string>
+    <string name="pref_network_use_system_http_proxy_summary">Forward Android system HTTP proxy (NekoBox / Clash system-proxy mode) into libmpv and multi-conn downloads. Global VPN/TUN is transparent and is not double-proxied. With no proxy, traffic stays direct.</string>
     <string name="pref_network_disable_multi_conn_under_proxy">Disable multi-conn under proxy</string>
     <string name="pref_network_disable_multi_conn_under_proxy_summary">When a system HTTP proxy is active, skip segmented multi-connection and use direct single-stream play. Off by default; turn on only if NekoBox or other proxies stall concurrent Range requests.</string>
     <string name="pref_network_tip_title">About cache speed</string>

@@ -235,6 +235,22 @@ class SegmentedHttpCache(
       return !isAdaptiveStreamingUrl(lower) && !isMediaServerTranscodeUrl(lower)
     }
 
+    /**
+     * Emby / Jellyfin / media-server stream URLs.
+     * Under VPN or fragile tunnels, multi-conn Range often fails while native single-stream works.
+     */
+    fun isMediaServerStreamUrl(url: String): Boolean {
+      val lower = url.lowercase(Locale.US)
+      return isMediaServerStreamUrlLower(lower)
+    }
+
+    private fun isMediaServerStreamUrlLower(urlLower: String): Boolean =
+      urlLower.contains("/emby/") ||
+        urlLower.contains("/jellyfin/") ||
+        (urlLower.contains("/videos/") && urlLower.contains("/stream")) ||
+        urlLower.contains("mediasourceid=") ||
+        isMediaServerTranscodeUrl(urlLower)
+
     private fun isAdaptiveStreamingUrl(urlLower: String): Boolean =
       urlLower.contains(".m3u8") ||
         urlLower.contains(".mpd") ||
