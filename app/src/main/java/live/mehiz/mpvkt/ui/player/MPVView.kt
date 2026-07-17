@@ -9,6 +9,7 @@ import android.view.KeyEvent
 import `is`.xyz.mpv.BaseMPVView
 import `is`.xyz.mpv.KeyMapping
 import `is`.xyz.mpv.MPVLib
+import live.mehiz.mpvkt.network.SystemHttpProxy
 import live.mehiz.mpvkt.preferences.AdvancedPreferences
 import live.mehiz.mpvkt.preferences.AudioPreferences
 import live.mehiz.mpvkt.preferences.DecoderPreferences
@@ -70,12 +71,18 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
     MPVLib.setPropertyBoolean("keep-open", true)
     MPVLib.setPropertyBoolean("input-default-bindings", true)
 
-    // Keep TLS defaults identical to upstream mpvKt (safe for HTTPS streams).
-    MPVLib.setOptionString("tls-verify", "yes")
+    // Honour user TLS preference (settings switch was previously ignored).
+    // NekoBox / MITM HTTPS inspection often needs this off or a custom CA.
+    MPVLib.setOptionString(
+      "tls-verify",
+      if (networkPreferences.tlsVerify.get()) "yes" else "no",
+    )
     MPVLib.setOptionString("tls-ca-file", "${context.filesDir.path}/cacert.pem")
 
     // Demuxer cache + conservative stream reconnect for long-pause resume.
     setupNetworkAndCacheOptions()
+    // libmpv does not read Android system proxy by itself — wire it for NekoBox etc.
+    applySystemHttpProxyIfPresent()
 
     val screenshotDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
     screenshotDir.mkdirs()
@@ -257,6 +264,29 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
     }
   }
 
+  /**
+   * Wire Android system HTTP(S) proxy into libmpv as a default for remote URLs.
+   *
+   * NekoBox "HTTP 代理 / 系统代理" 模式会设置 [android.net.ProxyInfo]；
+   * TUN 透明代理没有 ProxyInfo，流量会在系统层自动接管，无需这里处理。
+   * 播放本地 127.0.0.1 分片代理时，PlayerActivity 会在 loadfile 前清空 http-proxy。
+   */
+  private fun applySystemHttpProxyIfPresent() {
+    if (!networkPreferences.useSystemHttpProxy.get()) {
+      Log.d(TAG, "system http-proxy disabled by preference")
+      MPVLib.setOptionString("http-proxy", "")
+      return
+    }
+    val info = SystemHttpProxy.current(context) ?: run {
+      Log.d(TAG, "no system HTTP proxy detected")
+      MPVLib.setOptionString("http-proxy", "")
+      return
+    }
+    // mpv option `http-proxy` is used by FFmpeg's http protocol (HTTP CONNECT).
+    MPVLib.setOptionString("http-proxy", info.mpvHttpProxyUrl)
+    Log.i(TAG, "mpv http-proxy=${info.mpvHttpProxyUrl}")
+  }
+
   override fun observeProperties() {
     for ((name, format) in observedProps) MPVLib.observeProperty(name, format)
   }
@@ -373,5 +403,9 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
     MPVLib.setOptionString("sub-shadow-offset", subtitlesPreferences.shadowOffset.get().toString())
     MPVLib.setOptionString("sub-pos", subtitlesPreferences.subPos.get().toString())
     MPVLib.setOptionString("sub-scale", subtitlesPreferences.subScale.get().toString())
+  }
+
+  companion object {
+    private const val TAG = "MPVView"
   }
 }

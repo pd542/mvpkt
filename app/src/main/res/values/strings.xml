@@ -146,7 +146,11 @@
     <string name="pref_network_timeout">Network timeout</string>
     <string name="pref_network_stream_buffer_size">Stream buffer size</string>
     <string name="pref_network_tls_verify">Verify TLS certificates</string>
-    <string name="pref_network_tls_verify_summary">Disable only if your stream uses a self-signed certificate</string>
+    <string name="pref_network_tls_verify_summary">Disable only if your stream uses a self-signed certificate or a local MITM proxy (e.g. NekoBox HTTPS inspect)</string>
+    <string name="pref_network_use_system_http_proxy">Use system HTTP proxy</string>
+    <string name="pref_network_use_system_http_proxy_summary">Forward Android system proxy (NekoBox / Clash system-proxy mode) into libmpv and multi-conn downloads. TUN/VPN transparent mode needs no setting.</string>
+    <string name="pref_network_disable_multi_conn_under_proxy">Disable multi-conn under proxy</string>
+    <string name="pref_network_disable_multi_conn_under_proxy_summary">When a system HTTP proxy is active, skip segmented multi-connection and use direct single-stream play. Off by default; turn on only if NekoBox or other proxies stall concurrent Range requests.</string>
     <string name="pref_network_tip_title">About cache speed</string>
     <string name="pref_network_tip_summary">Decoder threads do NOT speed up download. For progressive HTTP(S) files, enable Multi-connection download (Range) to pull many chunks in parallel like a browser/IDM. HLS/m3u8 is not accelerated that way. Re-open the video after changing settings.</string>
     <string name="pref_network_category_multiconn">Multi-connection download</string>

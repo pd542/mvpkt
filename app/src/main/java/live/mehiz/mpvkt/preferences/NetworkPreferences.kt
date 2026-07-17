@@ -58,6 +58,21 @@ class NetworkPreferences(preferenceStore: PreferenceStore) {
   /** Enable TLS verification for https streams. */
   val tlsVerify = preferenceStore.getBoolean("network_tls_verify", true)
 
+  /**
+   * Forward Android system HTTP(S) proxy (NekoBox / Clash system-proxy mode, etc.)
+   * into libmpv `http-proxy` and Java multi-conn downloads.
+   * TUN/VPN transparent mode has no ProxyInfo and needs no setting.
+   */
+  val useSystemHttpProxy = preferenceStore.getBoolean("network_use_system_http_proxy", true)
+
+  /**
+   * When a system HTTP proxy is active, auto-disable multi-connection download.
+   * Off by default: multi-conn still runs under proxy (connections are capped).
+   * Enable only if NekoBox / HTTP proxy stalls concurrent Range streams.
+   */
+  val disableMultiConnUnderProxy =
+    preferenceStore.getBoolean("network_disable_multi_conn_under_proxy", false)
+
   /** Apply higher defaults tuned for network streams. Default off — safer playback. */
   val optimizeForNetwork = preferenceStore.getBoolean("network_optimize_for_streaming", false)
 

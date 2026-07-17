@@ -350,6 +350,24 @@ object NetworkPreferencesScreen : Screen {
             summary = { Text(stringResource(R.string.pref_network_demuxer_seekable_cache_summary)) },
           )
 
+          val useSystemHttpProxy by preferences.useSystemHttpProxy.collectAsState()
+          SwitchPreference(
+            value = useSystemHttpProxy,
+            onValueChange = preferences.useSystemHttpProxy::set,
+            title = { Text(stringResource(R.string.pref_network_use_system_http_proxy)) },
+            summary = { Text(stringResource(R.string.pref_network_use_system_http_proxy_summary)) },
+          )
+
+          val disableMultiConnUnderProxy by preferences.disableMultiConnUnderProxy.collectAsState()
+          SwitchPreference(
+            value = disableMultiConnUnderProxy,
+            onValueChange = preferences.disableMultiConnUnderProxy::set,
+            title = { Text(stringResource(R.string.pref_network_disable_multi_conn_under_proxy)) },
+            summary = {
+              Text(stringResource(R.string.pref_network_disable_multi_conn_under_proxy_summary))
+            },
+          )
+
           val tlsVerify by preferences.tlsVerify.collectAsState()
           SwitchPreference(
             value = tlsVerify,

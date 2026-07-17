@@ -58,6 +58,7 @@ import live.mehiz.mpvkt.database.entities.PlaybackStateEntity
 import live.mehiz.mpvkt.databinding.PlayerLayoutBinding
 import live.mehiz.mpvkt.domain.playbackstate.repository.PlaybackStateRepository
 import live.mehiz.mpvkt.network.SegmentedHttpCache
+import live.mehiz.mpvkt.network.SystemHttpProxy
 import live.mehiz.mpvkt.preferences.AdvancedPreferences
 import live.mehiz.mpvkt.preferences.AudioPreferences
 import live.mehiz.mpvkt.preferences.GesturePreferences
@@ -179,13 +180,14 @@ class PlayerActivity : AppCompatActivity() {
 
   private fun startPlayback(intent: Intent, useLoadfileCommand: Boolean) {
     val source = resolvePlayableUri(intent) ?: return
-    val wantSegmented = networkPreferences.multiConnectionDownload.get() &&
-      SegmentedHttpCache.shouldTryAccelerate(source)
+    // Multi-conn remains the default under system proxy (opt-in switch can disable it).
+    // Origin Range downloads go through SystemHttpProxy; mpv only reads the local proxy.
+    val wantSegmented = shouldUseSegmentedDownload(source)
 
     if (!wantSegmented) {
       segmentedSourceUrl = null
       stopSegmentedWatchdog()
-      // Direct play — same as upstream mpvKt.
+      // Direct play — same as upstream mpvKt (libmpv may use system http-proxy).
       playUri(source, useLoadfileCommand)
       return
     }
@@ -201,8 +203,55 @@ class PlayerActivity : AppCompatActivity() {
     }
   }
 
+  /** Detect Android system / NekoBox HTTP proxy when the preference allows it. */
+  private fun resolveSystemHttpProxy(): SystemHttpProxy.Info? {
+    if (!networkPreferences.useSystemHttpProxy.get()) return null
+    return SystemHttpProxy.current(applicationContext)
+  }
+
+  /**
+   * Multi-conn only when enabled and the URL is acceleratable.
+   * When a system HTTP proxy is active and [NetworkPreferences.disableMultiConnUnderProxy]
+   * is on (opt-in), skip segmented mode — some proxies stall many Ranges.
+   */
+  private fun shouldUseSegmentedDownload(source: String): Boolean {
+    if (!networkPreferences.multiConnectionDownload.get()) return false
+    if (!SegmentedHttpCache.shouldTryAccelerate(source)) return false
+    val proxy = resolveSystemHttpProxy()
+    if (proxy != null && networkPreferences.disableMultiConnUnderProxy.get()) {
+      Log.i(TAG, "skip multi-conn under system proxy ${proxy.mpvHttpProxyUrl}")
+      return false
+    }
+    return true
+  }
+
+  /**
+   * Local segmented proxy must not go through system http-proxy (would loop / hang).
+   * Remote URLs restore the system proxy so direct play still works under NekoBox.
+   */
+  private fun applyMpvHttpProxyForUri(uri: String) {
+    if (!networkPreferences.useSystemHttpProxy.get()) {
+      runCatching { MPVLib.setPropertyString("http-proxy", "") }
+      return
+    }
+    if (uri.isLocalSegmentedProxy()) {
+      // Loopback multi-conn cache — never tunnel through NekoBox.
+      runCatching { MPVLib.setPropertyString("http-proxy", "") }
+      Log.d(TAG, "cleared mpv http-proxy for local segmented URL")
+      return
+    }
+    val info = SystemHttpProxy.current(applicationContext)
+    if (info != null) {
+      runCatching { MPVLib.setPropertyString("http-proxy", info.mpvHttpProxyUrl) }
+      Log.d(TAG, "mpv http-proxy=${info.mpvHttpProxyUrl} for remote URL")
+    } else {
+      runCatching { MPVLib.setPropertyString("http-proxy", "") }
+    }
+  }
+
   private fun playUri(uri: String, useLoadfileCommand: Boolean) {
     val isLocalProxy = uri.isLocalSegmentedProxy()
+    applyMpvHttpProxyForUri(uri)
     // Local multi-conn proxy: always use loadfile so libmpv opens as network stream.
     if (useLoadfileCommand || isLocalProxy) {
       if (isLocalProxy) {
@@ -231,7 +280,7 @@ class PlayerActivity : AppCompatActivity() {
    * otherwise the original remote URL.
    */
   private fun maybeAccelerateHttp(uri: String): String {
-    if (!SegmentedHttpCache.shouldTryAccelerate(uri)) return uri
+    if (!shouldUseSegmentedDownload(uri)) return uri
 
     // Drop previous media's on-disk segments before starting a new download.
     clearSegmentedPlaybackCache()
@@ -240,12 +289,15 @@ class PlayerActivity : AppCompatActivity() {
     val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 4096)
     val cacheRoot = File(cacheDir, "segmented-http").also { it.mkdirs() }
     val requestHeaders = intentHeaders(intent.extras)
+    val systemProxy = resolveSystemHttpProxy()
     val accelerator = SegmentedHttpCache(
       cacheDir = cacheRoot,
       connections = connections,
       chunkBytes = chunkKb * 1024,
       userAgent = requestHeaders.userAgentOrDefault(),
       requestHeaders = requestHeaders,
+      systemProxy = systemProxy,
+      limitConnectionsUnderProxy = true,
     )
     val result = accelerator.open(uri)
     return if (result.usedSegmented) {
@@ -376,10 +428,13 @@ class PlayerActivity : AppCompatActivity() {
         val connections = networkPreferences.multiConnectionCount.get().coerceIn(2, 16)
         val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 4096)
         val cacheRoot = File(cacheDir, "segmented-http").also { it.mkdirs() }
+        val systemProxy = resolveSystemHttpProxy()
         val accelerator = SegmentedHttpCache(
           cacheDir = cacheRoot,
           connections = connections,
           chunkBytes = chunkKb * 1024,
+          systemProxy = systemProxy,
+          limitConnectionsUnderProxy = true,
         )
         val result = accelerator.open(source)
         if (result.usedSegmented) {

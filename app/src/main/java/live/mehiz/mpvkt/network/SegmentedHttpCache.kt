@@ -54,6 +54,16 @@ class SegmentedHttpCache(
   private val chunkBytes: Int,
   private val userAgent: String = DEFAULT_UA,
   private val requestHeaders: Map<String, String> = emptyMap(),
+  /**
+   * Optional Android system / NekoBox HTTP proxy. When set, all origin Range
+   * requests go through it; localhost playback proxy is never proxied.
+   */
+  private val systemProxy: SystemHttpProxy.Info? = null,
+  /**
+   * When true (or when [systemProxy] is set), cap parallel Range workers so
+   * SOCKS/HTTP proxies that limit concurrent streams do not stall head download.
+   */
+  private val limitConnectionsUnderProxy: Boolean = true,
 ) {
   private var session: Session? = null
 
@@ -84,7 +94,7 @@ class SegmentedHttpCache(
    */
   fun open(originalUrl: String): OpenResult {
     return runCatching {
-      val direct = resolveDirectMediaUrl(originalUrl, userAgent, requestHeaders)
+      val direct = resolveDirectMediaUrl(originalUrl, userAgent, requestHeaders, systemProxy)
       if (!isAcceleratableUrl(direct)) {
         // Prefer resolved direct URL for mpv even when not multi-conn.
         return@runCatching OpenResult(direct, false)
@@ -97,12 +107,18 @@ class SegmentedHttpCache(
   }
 
   private fun startSession(mediaUrl: String): OpenResult {
-    val probe = probe(mediaUrl, userAgent, requestHeaders)
+    val probe = probe(mediaUrl, userAgent, requestHeaders, systemProxy)
     if (!probe.supportsRange || probe.contentLength < MIN_FILE_FOR_ACCEL) {
       return OpenResult(mediaUrl, false)
     }
 
-    val connCount = connections.coerceIn(2, 16)
+    // Proxies (NekoBox HTTP/SOCKS, corporate MITM) often throttle many concurrent
+    // Range streams; keep 2–4 workers so head download still finishes.
+    val connCount = if (systemProxy != null && limitConnectionsUnderProxy) {
+      connections.coerceIn(2, 4)
+    } else {
+      connections.coerceIn(2, 16)
+    }
     val chunk = chunkBytes.coerceIn(MIN_CHUNK, MAX_CHUNK)
     val headBytes = min(probe.contentLength, HEAD_BYTES)
     val tailBytes = min(probe.contentLength / 4, TAIL_BYTES).coerceAtLeast(0L)
@@ -118,6 +134,7 @@ class SegmentedHttpCache(
         chunkBytes = chunk,
         userAgent = userAgent,
         requestHeaders = requestHeaders,
+        systemProxy = systemProxy,
       ),
       cacheDir = cacheDir,
       log = {},
@@ -259,6 +276,7 @@ class SegmentedHttpCache(
       url: String,
       userAgent: String = DEFAULT_UA,
       requestHeaders: Map<String, String> = emptyMap(),
+      systemProxy: SystemHttpProxy.Info? = null,
     ): String {
       val lower = url.lowercase(Locale.US)
       if (!lower.startsWith("http://") && !lower.startsWith("https://")) return url
@@ -276,7 +294,7 @@ class SegmentedHttpCache(
         while (hops < 8) {
           hops++
           // HEAD first — no body, safe for one-shot OpenList signs.
-          val head = openConnection(current, userAgent, cleanHeaders).apply {
+          val head = openConnection(current, userAgent, cleanHeaders, systemProxy).apply {
             requestMethod = "HEAD"
             instanceFollowRedirects = false
             connectTimeout = CONNECT_TIMEOUT_MS
@@ -307,7 +325,7 @@ class SegmentedHttpCache(
 
           // Some OpenList builds do not support HEAD — one full GET without Range,
           // but disconnect immediately after headers if redirected / large.
-          val get = openConnection(current, userAgent, cleanHeaders).apply {
+          val get = openConnection(current, userAgent, cleanHeaders, systemProxy).apply {
             requestMethod = "GET"
             instanceFollowRedirects = false
             connectTimeout = CONNECT_TIMEOUT_MS
@@ -351,15 +369,16 @@ class SegmentedHttpCache(
       url: String,
       userAgent: String = DEFAULT_UA,
       requestHeaders: Map<String, String> = emptyMap(),
+      systemProxy: SystemHttpProxy.Info? = null,
     ): ProbeResult {
       // Prefer HEAD first — does not download body and is safer for signed URLs
       // that somehow still reached probe.
-      val head = probeOnce(url, userAgent, requestHeaders, useHead = true)
+      val head = probeOnce(url, userAgent, requestHeaders, useHead = true, systemProxy = systemProxy)
       if (head.supportsRange && head.contentLength >= MIN_FILE_FOR_ACCEL && !isHtmlType(head.contentType)) {
         return head
       }
       // Fallback tiny Range GET only when HEAD did not prove Range support.
-      val get = probeOnce(url, userAgent, requestHeaders, useHead = false)
+      val get = probeOnce(url, userAgent, requestHeaders, useHead = false, systemProxy = systemProxy)
       if (isHtmlType(get.contentType) || get.contentLength in 1 until 8 * 1024) {
         // HTML error page or tiny payload — not a progressive video.
         return ProbeResult(false, get.contentLength, get.contentType, get.finalUrl)
@@ -377,8 +396,9 @@ class SegmentedHttpCache(
       userAgent: String,
       requestHeaders: Map<String, String>,
       useHead: Boolean,
+      systemProxy: SystemHttpProxy.Info? = null,
     ): ProbeResult {
-      val conn = openConnection(url, userAgent, requestHeaders.sanitizedForOrigin()).apply {
+      val conn = openConnection(url, userAgent, requestHeaders.sanitizedForOrigin(), systemProxy).apply {
         requestMethod = if (useHead) "HEAD" else "GET"
         if (!useHead) {
           setRequestProperty("Range", "bytes=0-0")
@@ -504,8 +524,14 @@ class SegmentedHttpCache(
       url: String,
       userAgent: String,
       requestHeaders: Map<String, String> = emptyMap(),
+      systemProxy: SystemHttpProxy.Info? = null,
     ): HttpURLConnection {
-      val conn = URL(url).openConnection() as HttpURLConnection
+      val useProxy = systemProxy != null && !systemProxy.shouldBypass(url)
+      val conn = if (useProxy) {
+        URL(url).openConnection(systemProxy!!.javaProxy) as HttpURLConnection
+      } else {
+        URL(url).openConnection() as HttpURLConnection
+      }
       conn.setRequestProperty("User-Agent", userAgent)
       conn.setRequestProperty("Accept", "*/*")
       conn.setRequestProperty("Connection", "keep-alive")
@@ -529,6 +555,7 @@ class SegmentedHttpCache(
     val chunkBytes: Int,
     val userAgent: String,
     val requestHeaders: Map<String, String>,
+    val systemProxy: SystemHttpProxy.Info? = null,
   )
 
   private class Session(
@@ -896,7 +923,12 @@ class SegmentedHttpCache(
     private fun downloadRangeAttempt(start: Long, end: Long): String? {
       var conn: HttpURLConnection? = null
       return try {
-        conn = openConnection(config.originUrl, config.userAgent, config.requestHeaders.sanitizedForOrigin()).apply {
+        conn = openConnection(
+          config.originUrl,
+          config.userAgent,
+          config.requestHeaders.sanitizedForOrigin(),
+          config.systemProxy,
+        ).apply {
           requestMethod = "GET"
           setRequestProperty("Range", "bytes=$start-$end")
           instanceFollowRedirects = true

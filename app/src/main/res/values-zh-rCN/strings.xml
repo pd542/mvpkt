@@ -111,7 +111,11 @@
     <string name="pref_network_timeout">网络超时</string>
     <string name="pref_network_stream_buffer_size">流缓冲大小</string>
     <string name="pref_network_tls_verify">校验证书（TLS）</string>
-    <string name="pref_network_tls_verify_summary">仅在使用自签名证书的串流时关闭</string>
+    <string name="pref_network_tls_verify_summary">仅在自签名证书或本地 MITM 代理（如 NekoBox HTTPS 解密）时关闭</string>
+    <string name="pref_network_use_system_http_proxy">使用系统 HTTP 代理</string>
+    <string name="pref_network_use_system_http_proxy_summary">把 Android 系统代理（NekoBox / Clash 系统代理模式）传给 libmpv 与多连接下载。TUN/VPN 透明代理无需设置。</string>
+    <string name="pref_network_disable_multi_conn_under_proxy">代理下关闭多连接</string>
+    <string name="pref_network_disable_multi_conn_under_proxy_summary">检测到系统 HTTP 代理时，跳过分片多连接，改用单连接直连播放。默认关闭；仅在 NekoBox 等代理把并发 Range 卡死时再打开。</string>
     <string name="pref_network_tip_title">关于缓存速度</string>
     <string name="pref_network_tip_summary">「解码线程数」不会加快下载。对普通 HTTP(S) 整文件（mp4/mkv 等），请开启「多连接分片下载」：用多个 Range 连接并行拉取，类似浏览器/IDM。HLS/m3u8 无法用这种方式加速。改设置后需重新打开视频。</string>
     <string name="pref_network_category_multiconn">多连接分片下载</string>
