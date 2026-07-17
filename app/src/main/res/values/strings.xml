@@ -158,8 +158,8 @@
     <string name="pref_network_multi_connection_summary">Downloads the video head first, then fills the rest with parallel HTTP Range requests (like a browser/IDM). Works for progressive mp4/mkv when the server supports Range. Auto-falls back to direct play if not. Not for HLS/m3u8.</string>
     <string name="pref_network_multi_connection_count">Parallel connections</string>
     <string name="pref_network_multi_connection_chunk">Chunk size</string>
-    <string name="pref_network_prefer_highest_bandwidth">Prefer highest stream quality</string>
-    <string name="pref_network_prefer_highest_bandwidth_summary">HLS: pick the top rung. Emby/Jellyfin: rewrite low-bitrate transcode URLs (e.g. VideoBitrate=64kbps) to original Static play. Uses more bandwidth.</string>
+    <string name="pref_network_prefer_highest_bandwidth">Prefer highest HLS bitrate</string>
+    <string name="pref_network_prefer_highest_bandwidth_summary">Pick the top quality rung when the stream is adaptive (HLS). Uses more bandwidth.</string>
     <string name="pref_network_demuxer_seekable_cache">Seekable demuxer cache</string>
     <string name="pref_network_demuxer_seekable_cache_summary">Keeps cached data seekable for smoother seeking on network streams</string>
     <string name="pref_network_threads_auto">Auto</string>

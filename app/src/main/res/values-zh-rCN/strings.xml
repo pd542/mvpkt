@@ -123,8 +123,8 @@
     <string name="pref_network_multi_connection_summary">先下载片头保证开播，再用多个 HTTP Range 连接并行填充（类似浏览器/IDM）。适用于支持断点续传的 mp4/mkv 直链；不支持时自动回退直连。不支持 HLS/m3u8。</string>
     <string name="pref_network_multi_connection_count">并行连接数</string>
     <string name="pref_network_multi_connection_chunk">分片大小</string>
-    <string name="pref_network_prefer_highest_bandwidth">优先最高清晰度</string>
-    <string name="pref_network_prefer_highest_bandwidth_summary">HLS 选最高档；Emby/Jellyfin 会把过低码率转码链接（如 VideoBitrate=64kbps）改写成原画 Static 直链，更耗流量</string>
+    <string name="pref_network_prefer_highest_bandwidth">优先最高 HLS 码率</string>
+    <string name="pref_network_prefer_highest_bandwidth_summary">自适应流（HLS）时选择最高清晰度档，更耗流量</string>
     <string name="pref_network_demuxer_seekable_cache">可跳转的解复用缓存</string>
     <string name="pref_network_demuxer_seekable_cache_summary">保留可 seek 的缓存，网络流拖动更顺畅</string>
     <string name="pref_network_threads_auto">自动</string>

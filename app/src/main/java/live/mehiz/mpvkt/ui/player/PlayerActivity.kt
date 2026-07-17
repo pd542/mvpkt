@@ -57,7 +57,6 @@ import live.mehiz.mpvkt.database.entities.CustomButtonEntity
 import live.mehiz.mpvkt.database.entities.PlaybackStateEntity
 import live.mehiz.mpvkt.databinding.PlayerLayoutBinding
 import live.mehiz.mpvkt.domain.playbackstate.repository.PlaybackStateRepository
-import live.mehiz.mpvkt.network.MediaServerStreamUrl
 import live.mehiz.mpvkt.network.PlaybackSessionLog
 import live.mehiz.mpvkt.network.SegmentedHttpCache
 import live.mehiz.mpvkt.network.SystemHttpProxy
@@ -186,8 +185,7 @@ class PlayerActivity : AppCompatActivity() {
   }
 
   private fun startPlayback(intent: Intent, useLoadfileCommand: Boolean) {
-    val rawSource = resolvePlayableUri(intent) ?: return
-    val source = rewriteMediaServerQuality(rawSource)
+    val source = resolvePlayableUri(intent) ?: return
     val multiPref = networkPreferences.multiConnectionDownload.get()
     PlaybackSessionLog.i(
       "PLAY",
@@ -222,31 +220,6 @@ class PlayerActivity : AppCompatActivity() {
       playUri(playable, useLoadfileCommand)
       if (playable.isLocalSegmentedProxy()) startSegmentedWatchdog() else stopSegmentedWatchdog()
     }
-  }
-
-  /**
-   * Emby/Jellyfin clients often pass a low-bitrate transcode URL
-   * (`VideoBitrate=64000`, `TranscodeReasons=…`). Rewrite toward Static original
-   * when [NetworkPreferences.preferHighestBandwidth] is on.
-   */
-  private fun rewriteMediaServerQuality(url: String): String {
-    val prefer = networkPreferences.preferHighestBandwidth.get()
-    val result = MediaServerStreamUrl.preferOriginalQuality(url, preferOriginal = prefer)
-    if (result.changed) {
-      PlaybackSessionLog.i(
-        "EMBY",
-        "quality rewrite reason=${result.reason} " +
-          "from=${PlaybackSessionLog.redactUrl(url)} " +
-          "to=${PlaybackSessionLog.redactUrl(result.url)}",
-      )
-    } else if (MediaServerStreamUrl.isLikelyMediaServerStream(url)) {
-      PlaybackSessionLog.i(
-        "EMBY",
-        "quality rewrite skipped reason=${result.reason} " +
-          "preferHighest=$prefer lowTranscode=${MediaServerStreamUrl.isLowQualityTranscode(url)}",
-      )
-    }
-    return result.url
   }
 
   private fun startPlaybackLogHeartbeat() {
