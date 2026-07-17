@@ -210,25 +210,14 @@ class PlayerActivity : AppCompatActivity() {
   }
 
   /**
-   * Multi-conn only when enabled and the URL is acceleratable.
-   *
-   * Special cases that force **direct** play (libmpv single stream):
-   * - Emby/Jellyfin under **VPN/TUN** (NekoBox 全局 VPN): multi Range through the tunnel
-   *   often hangs while native HTTP works.
-   * - Optional [NetworkPreferences.disableMultiConnUnderProxy] when a pure system HTTP
-   *   proxy is active (not VPN).
+   * Multi-conn when enabled and the URL is acceleratable.
+   * Emby/Jellyfin direct streams use segmented by default (including under VPN/TUN).
+   * Optional [NetworkPreferences.disableMultiConnUnderProxy] can skip multi-conn when a
+   * pure system HTTP proxy is active (not VPN transparent mode).
    */
   private fun shouldUseSegmentedDownload(source: String): Boolean {
     if (!networkPreferences.multiConnectionDownload.get()) return false
     if (!SegmentedHttpCache.shouldTryAccelerate(source)) return false
-    // Global VPN: keep multi-conn for generic CDN, but Emby/media-server must stay native.
-    if (
-      SystemHttpProxy.isVpnActive(applicationContext) &&
-      SegmentedHttpCache.isMediaServerStreamUrl(source)
-    ) {
-      Log.i(TAG, "skip multi-conn for media-server URL under VPN")
-      return false
-    }
     val proxy = resolveSystemHttpProxy()
     if (proxy != null && networkPreferences.disableMultiConnUnderProxy.get()) {
       Log.i(TAG, "skip multi-conn under system proxy ${proxy.mpvHttpProxyUrl}")
