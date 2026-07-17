@@ -1,3 +1,5 @@
+@file:Suppress("TooManyFunctions")
+
 package live.mehiz.mpvkt.ui.player
 
 import android.annotation.SuppressLint
@@ -768,7 +770,6 @@ class PlayerActivity : AppCompatActivity() {
 
   private fun Map<String, String>.userAgentOrDefault(): String =
     entries.firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }?.value ?: DEFAULT_SEGMENTED_UA
-  }
 
   @Suppress("NestedBlockDepth")
   private fun parsePathFromIntent(intent: Intent): String? {
