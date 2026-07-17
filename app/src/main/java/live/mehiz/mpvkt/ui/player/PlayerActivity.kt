@@ -237,10 +237,13 @@ class PlayerActivity : AppCompatActivity() {
     val connections = networkPreferences.multiConnectionCount.get().coerceIn(2, 16)
     val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 4096)
     val cacheRoot = File(cacheDir, "segmented-http").also { it.mkdirs() }
+    val requestHeaders = intentHeaders(intent.extras)
     val accelerator = SegmentedHttpCache(
       cacheDir = cacheRoot,
       connections = connections,
       chunkBytes = chunkKb * 1024,
+      userAgent = requestHeaders.userAgentOrDefault(),
+      requestHeaders = requestHeaders,
     )
     val result = accelerator.open(uri)
     return if (result.usedSegmented) {
@@ -744,12 +747,27 @@ class PlayerActivity : AppCompatActivity() {
       }
     }
 
-    extras.getStringArray("headers")?.let { headers ->
-      if (headers[0].startsWith("User-Agent", true)) MPVLib.setPropertyString("user-agent", headers[1])
-      val headersString = headers.asSequence().drop(2).chunked(2).associate { it[0] to it[1] }
-        .map { "${it.key}: ${it.value.replace(",", "\\,")}" }.joinToString(",")
-      MPVLib.setPropertyString("http-header-fields", headersString)
-    }
+    val headers = intentHeaders(extras)
+    headers.entries
+      .firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }
+      ?.let { MPVLib.setPropertyString("user-agent", it.value) }
+    val headersString = headers
+      .filterKeys { !it.equals("User-Agent", ignoreCase = true) }
+      .map { "${it.key}: ${it.value.replace(",", "\\,")}" }
+      .joinToString(",")
+    if (headersString.isNotBlank()) MPVLib.setPropertyString("http-header-fields", headersString)
+  }
+
+  private fun intentHeaders(extras: Bundle?): Map<String, String> {
+    val raw = extras?.getStringArray("headers") ?: return emptyMap()
+    return raw.asSequence()
+      .chunked(2)
+      .filter { it.size == 2 && it[0].isNotBlank() && it[1].isNotBlank() }
+      .associate { it[0] to it[1] }
+  }
+
+  private fun Map<String, String>.userAgentOrDefault(): String =
+    entries.firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }?.value ?: DEFAULT_SEGMENTED_UA
   }
 
   @Suppress("NestedBlockDepth")
@@ -1227,6 +1245,9 @@ class PlayerActivity : AppCompatActivity() {
     private const val SEGMENTED_STALL_TIMEOUT_MS = 10_000L
     private const val SEGMENTED_MIN_CACHED_AHEAD_BYTES = 256L * 1024L
     private const val SEGMENTED_RECONNECT_COOLDOWN_MS = 20_000L
+    private const val DEFAULT_SEGMENTED_UA =
+      "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) " +
+        "Chrome/120.0.0.0 Mobile Safari/537.36"
   }
 }
 

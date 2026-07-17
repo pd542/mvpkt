@@ -53,6 +53,7 @@ class SegmentedHttpCache(
   private val connections: Int,
   private val chunkBytes: Int,
   private val userAgent: String = DEFAULT_UA,
+  private val requestHeaders: Map<String, String> = emptyMap(),
 ) {
   private var session: Session? = null
 
@@ -83,7 +84,7 @@ class SegmentedHttpCache(
    */
   fun open(originalUrl: String): OpenResult {
     return runCatching {
-      val direct = resolveDirectMediaUrl(originalUrl, userAgent)
+      val direct = resolveDirectMediaUrl(originalUrl, userAgent, requestHeaders)
       if (!isAcceleratableUrl(direct)) {
         // Prefer resolved direct URL for mpv even when not multi-conn.
         return@runCatching OpenResult(direct, false)
@@ -96,7 +97,7 @@ class SegmentedHttpCache(
   }
 
   private fun startSession(mediaUrl: String): OpenResult {
-    val probe = probe(mediaUrl, userAgent)
+    val probe = probe(mediaUrl, userAgent, requestHeaders)
     if (!probe.supportsRange || probe.contentLength < MIN_FILE_FOR_ACCEL) {
       return OpenResult(mediaUrl, false)
     }
@@ -116,6 +117,7 @@ class SegmentedHttpCache(
         connections = connCount,
         chunkBytes = chunk,
         userAgent = userAgent,
+        requestHeaders = requestHeaders,
       ),
       cacheDir = cacheDir,
       log = {},
@@ -196,8 +198,8 @@ class SegmentedHttpCache(
     fun isAcceleratableUrl(url: String): Boolean {
       val lower = url.lowercase(Locale.US)
       if (!lower.startsWith("http://") && !lower.startsWith("https://")) return false
-      // Adaptive streaming / media-server endpoints — mpv handles these natively.
-      if (isAdaptiveStreamingUrl(lower) || isEmbyLikeUrl(lower)) return false
+      // Adaptive streaming / transcoding endpoints — mpv handles these natively.
+      if (isAdaptiveStreamingUrl(lower) || isMediaServerTranscodeUrl(lower)) return false
       // OpenList/Alist intermediate /d/?sign= links are NOT final media — resolve first.
       // Real CDN signed URLs (X-Amz-*) ARE acceleratable after resolve.
       if (isOpenListIntermediate(lower)) {
@@ -213,7 +215,7 @@ class SegmentedHttpCache(
     fun shouldTryAccelerate(url: String): Boolean {
       val lower = url.lowercase(Locale.US)
       if (!lower.startsWith("http://") && !lower.startsWith("https://")) return false
-      return !isAdaptiveStreamingUrl(lower) && !isEmbyLikeUrl(lower)
+      return !isAdaptiveStreamingUrl(lower) && !isMediaServerTranscodeUrl(lower)
     }
 
     private fun isAdaptiveStreamingUrl(urlLower: String): Boolean =
@@ -225,18 +227,16 @@ class SegmentedHttpCache(
         urlLower.contains("playlist")
 
     /**
-     * Emby/Jellyfin endpoints often require auth headers and can represent transcoding
-     * sessions or quality-selected streams. The local segmented proxy cannot preserve
-     * that full protocol, so leave these URLs to mpv's native HTTP/HLS handling.
+     * Transcoded / quality-capped media-server sessions are not byte-stable files.
+     * Direct static Emby/Jellyfin streams can still use Range once auth headers are preserved.
      */
-    private fun isEmbyLikeUrl(urlLower: String): Boolean =
-      urlLower.contains("/emby/") ||
-        urlLower.contains("/jellyfin/") ||
-        urlLower.contains("/videos/") && urlLower.contains("/stream") ||
-        urlLower.contains("mediasourceid=") ||
+    private fun isMediaServerTranscodeUrl(urlLower: String): Boolean =
+      urlLower.contains("/transcode") ||
+        urlLower.contains("transcoding") ||
+        urlLower.contains("transcodingid=") ||
         urlLower.contains("videobitrate=") ||
         urlLower.contains("audiobitrate=") ||
-        urlLower.contains("transcoding")
+        urlLower.contains("maxstreamingbitrate=")
 
     /** Alist/OpenList proxy download path that is not the real CDN object. */
     fun isOpenListIntermediate(urlLower: String): Boolean {
@@ -255,7 +255,11 @@ class SegmentedHttpCache(
      * Follow redirects / OpenList gate to the real media CDN URL.
      * Does not use Range on the first hop so one-shot OpenList signs stay valid.
      */
-    fun resolveDirectMediaUrl(url: String, userAgent: String = DEFAULT_UA): String {
+    fun resolveDirectMediaUrl(
+      url: String,
+      userAgent: String = DEFAULT_UA,
+      requestHeaders: Map<String, String> = emptyMap(),
+    ): String {
       val lower = url.lowercase(Locale.US)
       if (!lower.startsWith("http://") && !lower.startsWith("https://")) return url
       // Real object-store signed URLs are already final.
@@ -266,12 +270,13 @@ class SegmentedHttpCache(
         return url
       }
       return try {
+        val cleanHeaders = requestHeaders.sanitizedForOrigin()
         var current = url
         var hops = 0
         while (hops < 8) {
           hops++
           // HEAD first — no body, safe for one-shot OpenList signs.
-          val head = openConnection(current, userAgent).apply {
+          val head = openConnection(current, userAgent, cleanHeaders).apply {
             requestMethod = "HEAD"
             instanceFollowRedirects = false
             connectTimeout = CONNECT_TIMEOUT_MS
@@ -302,7 +307,7 @@ class SegmentedHttpCache(
 
           // Some OpenList builds do not support HEAD — one full GET without Range,
           // but disconnect immediately after headers if redirected / large.
-          val get = openConnection(current, userAgent).apply {
+          val get = openConnection(current, userAgent, cleanHeaders).apply {
             requestMethod = "GET"
             instanceFollowRedirects = false
             connectTimeout = CONNECT_TIMEOUT_MS
@@ -342,15 +347,19 @@ class SegmentedHttpCache(
       }
     }
 
-    fun probe(url: String, userAgent: String = DEFAULT_UA): ProbeResult {
+    fun probe(
+      url: String,
+      userAgent: String = DEFAULT_UA,
+      requestHeaders: Map<String, String> = emptyMap(),
+    ): ProbeResult {
       // Prefer HEAD first — does not download body and is safer for signed URLs
       // that somehow still reached probe.
-      val head = probeOnce(url, userAgent, useHead = true)
+      val head = probeOnce(url, userAgent, requestHeaders, useHead = true)
       if (head.supportsRange && head.contentLength >= MIN_FILE_FOR_ACCEL && !isHtmlType(head.contentType)) {
         return head
       }
       // Fallback tiny Range GET only when HEAD did not prove Range support.
-      val get = probeOnce(url, userAgent, useHead = false)
+      val get = probeOnce(url, userAgent, requestHeaders, useHead = false)
       if (isHtmlType(get.contentType) || get.contentLength in 1 until 8 * 1024) {
         // HTML error page or tiny payload — not a progressive video.
         return ProbeResult(false, get.contentLength, get.contentType, get.finalUrl)
@@ -363,8 +372,13 @@ class SegmentedHttpCache(
       return t.contains("text/html") || t.contains("application/xhtml")
     }
 
-    private fun probeOnce(url: String, userAgent: String, useHead: Boolean): ProbeResult {
-      val conn = openConnection(url, userAgent).apply {
+    private fun probeOnce(
+      url: String,
+      userAgent: String,
+      requestHeaders: Map<String, String>,
+      useHead: Boolean,
+    ): ProbeResult {
+      val conn = openConnection(url, userAgent, requestHeaders.sanitizedForOrigin()).apply {
         requestMethod = if (useHead) "HEAD" else "GET"
         if (!useHead) {
           setRequestProperty("Range", "bytes=0-0")
@@ -486,12 +500,22 @@ class SegmentedHttpCache(
       return clean
     }
 
-    fun openConnection(url: String, userAgent: String): HttpURLConnection {
+    fun openConnection(
+      url: String,
+      userAgent: String,
+      requestHeaders: Map<String, String> = emptyMap(),
+    ): HttpURLConnection {
       val conn = URL(url).openConnection() as HttpURLConnection
       conn.setRequestProperty("User-Agent", userAgent)
       conn.setRequestProperty("Accept", "*/*")
       conn.setRequestProperty("Connection", "keep-alive")
+      requestHeaders.forEach { (name, value) -> conn.setRequestProperty(name, value) }
       return conn
+    }
+
+    private fun Map<String, String>.sanitizedForOrigin(): Map<String, String> = filterKeys { name ->
+      val lower = name.lowercase(Locale.US)
+      lower != "range" && lower != "connection" && lower != "host" && lower != "accept-encoding"
     }
   }
 
@@ -504,6 +528,7 @@ class SegmentedHttpCache(
     val connections: Int,
     val chunkBytes: Int,
     val userAgent: String,
+    val requestHeaders: Map<String, String>,
   )
 
   private class Session(
@@ -871,7 +896,7 @@ class SegmentedHttpCache(
     private fun downloadRangeAttempt(start: Long, end: Long): String? {
       var conn: HttpURLConnection? = null
       return try {
-        conn = openConnection(config.originUrl, config.userAgent).apply {
+        conn = openConnection(config.originUrl, config.userAgent, config.requestHeaders.sanitizedForOrigin()).apply {
           requestMethod = "GET"
           setRequestProperty("Range", "bytes=$start-$end")
           instanceFollowRedirects = true
