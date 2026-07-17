@@ -196,14 +196,8 @@ class SegmentedHttpCache(
     fun isAcceleratableUrl(url: String): Boolean {
       val lower = url.lowercase(Locale.US)
       if (!lower.startsWith("http://") && !lower.startsWith("https://")) return false
-      // Adaptive streaming — mpv handles natively.
-      val adaptive = lower.contains(".m3u8") ||
-        lower.contains(".mpd") ||
-        lower.contains("format=m3u") ||
-        lower.contains("type=m3u8") ||
-        lower.contains("/hls/") ||
-        lower.contains("playlist")
-      if (adaptive) return false
+      // Adaptive streaming / media-server endpoints — mpv handles these natively.
+      if (isAdaptiveStreamingUrl(lower) || isEmbyLikeUrl(lower)) return false
       // OpenList/Alist intermediate /d/?sign= links are NOT final media — resolve first.
       // Real CDN signed URLs (X-Amz-*) ARE acceleratable after resolve.
       if (isOpenListIntermediate(lower)) {
@@ -219,14 +213,30 @@ class SegmentedHttpCache(
     fun shouldTryAccelerate(url: String): Boolean {
       val lower = url.lowercase(Locale.US)
       if (!lower.startsWith("http://") && !lower.startsWith("https://")) return false
-      val adaptive = lower.contains(".m3u8") ||
-        lower.contains(".mpd") ||
-        lower.contains("format=m3u") ||
-        lower.contains("type=m3u8") ||
-        lower.contains("/hls/") ||
-        lower.contains("playlist")
-      return !adaptive
+      return !isAdaptiveStreamingUrl(lower) && !isEmbyLikeUrl(lower)
     }
+
+    private fun isAdaptiveStreamingUrl(urlLower: String): Boolean =
+      urlLower.contains(".m3u8") ||
+        urlLower.contains(".mpd") ||
+        urlLower.contains("format=m3u") ||
+        urlLower.contains("type=m3u8") ||
+        urlLower.contains("/hls/") ||
+        urlLower.contains("playlist")
+
+    /**
+     * Emby/Jellyfin endpoints often require auth headers and can represent transcoding
+     * sessions or quality-selected streams. The local segmented proxy cannot preserve
+     * that full protocol, so leave these URLs to mpv's native HTTP/HLS handling.
+     */
+    private fun isEmbyLikeUrl(urlLower: String): Boolean =
+      urlLower.contains("/emby/") ||
+        urlLower.contains("/jellyfin/") ||
+        urlLower.contains("/videos/") && urlLower.contains("/stream") ||
+        urlLower.contains("mediasourceid=") ||
+        urlLower.contains("videobitrate=") ||
+        urlLower.contains("audiobitrate=") ||
+        urlLower.contains("transcoding")
 
     /** Alist/OpenList proxy download path that is not the real CDN object. */
     fun isOpenListIntermediate(urlLower: String): Boolean {
