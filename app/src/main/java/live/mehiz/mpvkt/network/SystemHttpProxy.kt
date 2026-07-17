@@ -80,9 +80,13 @@ object SystemHttpProxy {
       val caps = cm.getNetworkCapabilities(network) ?: return false
       caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
     } else {
-      @Suppress("DEPRECATION")
-      cm.activeNetworkInfo?.type == ConnectivityManager.TYPE_VPN
+      isLegacyVpnActive(cm)
     }
+  }
+
+  @Suppress("DEPRECATION")
+  private fun isLegacyVpnActive(cm: ConnectivityManager): Boolean {
+    return cm.activeNetworkInfo?.type == ConnectivityManager.TYPE_VPN
   }
 
   private fun fromConnectivityManager(context: Context): Info? {
@@ -95,14 +99,20 @@ object SystemHttpProxy {
   }
 
   private fun readDefaultProxy(cm: ConnectivityManager): ProxyInfo? {
-    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-      cm.defaultProxy
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+      return cm.defaultProxy
+    }
+    return readLegacyDefaultProxy()
+  }
+
+  @Suppress("DEPRECATION")
+  private fun readLegacyDefaultProxy(): ProxyInfo? {
+    val host = android.net.Proxy.getDefaultHost()
+    val port = android.net.Proxy.getDefaultPort()
+    return if (!host.isNullOrBlank() && port > 0) {
+      ProxyInfo.buildDirectProxy(host, port)
     } else {
-      @Suppress("DEPRECATION")
-      val host = android.net.Proxy.getDefaultHost()
-      @Suppress("DEPRECATION")
-      val port = android.net.Proxy.getDefaultPort()
-      if (!host.isNullOrBlank() && port > 0) ProxyInfo.buildDirectProxy(host, port) else null
+      null
     }
   }
 
