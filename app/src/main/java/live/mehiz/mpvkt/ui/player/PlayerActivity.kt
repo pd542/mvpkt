@@ -1011,24 +1011,31 @@ class PlayerActivity : AppCompatActivity() {
    * body (hole at playhead), not the real end of the movie.
    */
   private fun tryRecoverSegmentedFalseEof(): Boolean {
-    if (segmentedHttpCache == null || segmentedSourceUrl == null) return false
-    if (segmentedReconnectInProgress) return false
-    val position = viewModel.pos ?: return false
-    val duration = viewModel.duration ?: return false
-    if (duration <= 5 || position >= duration - 3) return false
+    val position = viewModel.pos
+    val duration = viewModel.duration
     val now = System.currentTimeMillis()
-    if (now - lastSegmentedReconnectAtMs < SEGMENTED_RECONNECT_COOLDOWN_MS) {
-      PlaybackSessionLog.w(
-        "SEG",
-        "false EOF at pos=$position/$duration but reconnect cooling down",
-      )
+    val midFile = position != null && duration != null && duration > 5 && position < duration - 3
+    val coolingDown = now - lastSegmentedReconnectAtMs < SEGMENTED_RECONNECT_COOLDOWN_MS
+    val ready = segmentedHttpCache != null &&
+      segmentedSourceUrl != null &&
+      !segmentedReconnectInProgress &&
+      midFile &&
+      !coolingDown
+    if (!ready) {
+      if (segmentedHttpCache != null && midFile && coolingDown) {
+        PlaybackSessionLog.w(
+          "SEG",
+          "false EOF at pos=$position/$duration but reconnect cooling down",
+        )
+      }
       return false
     }
     PlaybackSessionLog.w(
       "SEG",
       "false EOF at pos=$position/$duration — reconnect segmented multi-conn",
     )
-    reconnectSegmentedCache(position)
+    // midFile guarantees non-null position.
+    reconnectSegmentedCache(requireNotNull(position))
     lastSegmentedReconnectAtMs = now
     return true
   }
