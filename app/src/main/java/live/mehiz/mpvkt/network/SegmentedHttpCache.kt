@@ -225,16 +225,21 @@ class SegmentedHttpCache(
     private const val MAX_ENSURE_TIMEOUT_MS = 12_000L
 
     /** Max playhead priority window size (bytes). */
-    private const val MAX_PRIORITY_AHEAD = 4L * 1024L * 1024L
+    private const val MAX_PRIORITY_AHEAD = 8L * 1024L * 1024L
 
     /** Prefer asking for at least this many bytes ahead of the read cursor. */
-    private const val MIN_STREAM_BYTES = 256L * 1024L
+    private const val MIN_STREAM_BYTES = 512L * 1024L
 
     /** First bytes needed to answer a seek quickly; more data is prefetched in background. */
-    private const val SEEK_START_BYTES = 128L * 1024L
+    private const val SEEK_START_BYTES = 256L * 1024L
 
-    /** Soft cap on empty-read retries before aborting one response body. */
-    private const val BODY_IDLE_ROUNDS_MAX = 80
+    /**
+     * Soft cap on empty-read retries before aborting one response body.
+     * Each idle sleep is ~50ms → 300 ≈ 15s when the CDN is silent.
+     * While background Range workers still write, use the higher cap.
+     */
+    private const val BODY_IDLE_ROUNDS_MAX = 300
+    private const val BODY_IDLE_ROUNDS_WHILE_DOWNLOADING = 1_200
 
     /** Move this far (or jump outside window) before treating as a new seek generation. */
     private const val PRIORITY_SEEK_DELTA = 512L * 1024L
@@ -830,15 +835,18 @@ class SegmentedHttpCache(
       val chunk = config.chunkBytes.toLong()
       while (running.get() && pos < config.totalSize) {
         // 1) Serve seek/playhead holes first (if still active).
+        // Sparse multi-conn can leave holes at the playhead while total downloaded is large;
+        // always drain the live window before sequential tip fill.
         val priority = activePriorityWindow()
         if (priority != null) {
           val (pStart, pEnd) = priority
-          val need = !store.isFullyCovered(pStart, pEnd)
-          if (need) {
-            val deadline = System.currentTimeMillis() + 8_000L
-            fillWindowParallel(pStart, pEnd, deadline)
-            if (!store.isFullyCovered(pStart, min(pEnd, config.totalSize))) {
-              runCatching { Thread.sleep(30) }
+          val holeStart = pStart + store.contiguousFrom(pStart)
+          if (holeStart < pEnd) {
+            val deadline = System.currentTimeMillis() + 10_000L
+            fillWindowParallel(holeStart, pEnd, deadline)
+            if (store.contiguousFrom(pStart) + pStart < pEnd) {
+              // Still sparse — keep hammering the playhead, do not waste workers on tip.
+              runCatching { Thread.sleep(20) }
               continue
             }
             log("priority window filled $pStart-$pEnd")
@@ -854,7 +862,7 @@ class SegmentedHttpCache(
         val livePriority = activePriorityWindow()
         if (livePriority != null) {
           val (ps2, pe2) = livePriority
-          if (!store.isFullyCovered(ps2, pe2)) continue
+          if (ps2 + store.contiguousFrom(ps2) < pe2) continue
         }
 
         val jobs = ArrayList<Future<*>>(stripe)
@@ -1138,8 +1146,10 @@ class SegmentedHttpCache(
         var pos = start
         var idleRounds = 0
         // No hard total-body deadline — long progressive files must stream for minutes.
-        // Only abort after sustained no-progress (idleRounds), which still unsticks seeks.
-        val ahead = maxOf(config.chunkBytes.toLong() * 3L, MAX_PRIORITY_AHEAD)
+        // Only abort after sustained no-progress (idleRounds). Closing early with a
+        // declared Content-Length causes lavf to treat the short body as real EOF
+        // mid-movie (false eof-reached while pos << duration).
+        val ahead = maxOf(config.chunkBytes.toLong() * 4L, MAX_PRIORITY_AHEAD)
         while (remaining > 0 && running.get()) {
           val want = min(buf.size.toLong(), remaining).toInt()
           val needEnd = min(
@@ -1147,14 +1157,32 @@ class SegmentedHttpCache(
             pos + remaining,
           )
           setPlayheadPriority(pos, min(config.totalSize, pos + ahead))
-          val ok = ensureRange(pos, needEnd, 6_000L)
+          val ok = ensureRange(pos, needEnd, 10_000L)
           val avail = store.contiguousFrom(pos).toInt()
           if (avail <= 0) {
             idleRounds++
-            if (idleRounds > BODY_IDLE_ROUNDS_MAX) {
-              log("BodyReader abort at $pos remain=$remaining idle=$idleRounds ok=$ok")
-              // Abort without padding — client sees connection close mid-body and retries.
+            val writing = System.currentTimeMillis() - lastWriteAtMs.get() < 20_000L
+            val maxIdle = if (writing) {
+              BODY_IDLE_ROUNDS_WHILE_DOWNLOADING
+            } else {
+              BODY_IDLE_ROUNDS_MAX
+            }
+            if (idleRounds > maxIdle) {
+              log(
+                "BodyReader abort at $pos remain=$remaining idle=$idleRounds " +
+                  "ok=$ok writing=$writing downloaded=${downloaded.get()}",
+              )
+              PlaybackSessionLog.w(
+                "SEG",
+                "BodyReader short-close at byte=$pos remain=$remaining " +
+                  "(likely false EOF for mpv)",
+              )
+              // Abort without padding — client sees connection close mid-body.
               break
+            }
+            // Re-hit the hole with a longer ensure while waiting.
+            if (idleRounds % 10 == 0) {
+              ensureRange(pos, min(config.totalSize, pos + MIN_STREAM_BYTES * 2), 12_000L)
             }
             runCatching { Thread.sleep(50) }
             continue

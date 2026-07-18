@@ -993,11 +993,44 @@ class PlayerActivity : AppCompatActivity() {
           PlaybackSessionLog.w("MPV", "eof-reached=true")
           PlaybackSessionLog.snapshotPlayback("EOF")
         }
+        // Sparse multi-conn proxy can short-close a body → lavf reports EOF mid-movie.
+        // Recover instead of wiping cache when we are clearly not at the real end.
+        if (tryRecoverSegmentedFalseEof()) {
+          lastEofReached = false
+          return
+        }
         clearSegmentedPlaybackCache()
         if (playerPreferences.closeAfterReachingEndOfVideo.get()) finishAndRemoveTask()
       }
       "eof-reached" -> lastEofReached = value
     }
+  }
+
+  /**
+   * Mid-file `eof-reached` under segmented multi-conn is almost always a short proxy
+   * body (hole at playhead), not the real end of the movie.
+   */
+  private fun tryRecoverSegmentedFalseEof(): Boolean {
+    if (segmentedHttpCache == null || segmentedSourceUrl == null) return false
+    if (segmentedReconnectInProgress) return false
+    val position = viewModel.pos ?: return false
+    val duration = viewModel.duration ?: return false
+    if (duration <= 5 || position >= duration - 3) return false
+    val now = System.currentTimeMillis()
+    if (now - lastSegmentedReconnectAtMs < SEGMENTED_RECONNECT_COOLDOWN_MS) {
+      PlaybackSessionLog.w(
+        "SEG",
+        "false EOF at pos=$position/$duration but reconnect cooling down",
+      )
+      return false
+    }
+    PlaybackSessionLog.w(
+      "SEG",
+      "false EOF at pos=$position/$duration — reconnect segmented multi-conn",
+    )
+    reconnectSegmentedCache(position)
+    lastSegmentedReconnectAtMs = now
+    return true
   }
 
   internal fun onObserverEvent(property: String, value: String) {
