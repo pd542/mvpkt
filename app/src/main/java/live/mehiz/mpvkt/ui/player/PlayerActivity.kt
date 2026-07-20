@@ -506,51 +506,63 @@ class PlayerActivity : AppCompatActivity() {
       val reopened = withContext(Dispatchers.IO) {
         oldCache?.deleteCache()
         purgeSegmentedHttpCacheDir()
-        val connections = networkPreferences.multiConnectionCount.get().coerceIn(2, 16)
-        val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 4096)
-        val cacheRoot = File(cacheDir, "segmented-http").also { it.mkdirs() }
-        val systemProxy = resolveSystemHttpProxy()
-        val requestHeaders = playbackHttpHeaders(source, intent.extras)
-        val accelerator = SegmentedHttpCache(
-          cacheDir = cacheRoot,
-          connections = connections,
-          chunkBytes = chunkKb * 1024,
-          userAgent = requestHeaders.userAgentOrDefault(),
-          requestHeaders = requestHeaders,
-          systemProxy = systemProxy,
-          limitConnectionsUnderProxy = true,
-        )
-        val result = accelerator.open(source)
-        if (result.usedSegmented) {
-          accelerator to result.playPath
-        } else {
-          accelerator.deleteCache()
-          null to null
-        }
+        reopenSegmentedCache(source)
       }
-      val cache = reopened.first
-      val playPath = reopened.second
-      if (cache == null || playPath == null) {
-        PlaybackSessionLog.e(
-          "SEG",
-          "reconnect failed — multi-conn reopen unsuccessful src=${PlaybackSessionLog.redactUrl(source)}",
-        )
-        segmentedSourceUrl = source
-        segmentedReconnectInProgress = false
-        startSegmentedWatchdog()
-        return@launch
-      }
-      PlaybackSessionLog.i(
-        "SEG",
-        "reconnect ok playPath=${PlaybackSessionLog.redactUrl(playPath)} seekTo=$position",
-      )
-      segmentedHttpCache = cache
-      segmentedSourceUrl = source
-      segmentedPendingSeek = position
-      playUri(playPath, useLoadfileCommand = true)
-      // The watchdog restarts after the reloaded file is actually loaded.
-      startSegmentedWatchdog()
+      applyReopenedSegmentedCache(source, position, reopened)
     }
+  }
+
+  private fun reopenSegmentedCache(source: String): Pair<SegmentedHttpCache?, String?> {
+    val connections = networkPreferences.multiConnectionCount.get().coerceIn(2, 16)
+    val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 4096)
+    val cacheRoot = File(cacheDir, "segmented-http").also { it.mkdirs() }
+    val requestHeaders = playbackHttpHeaders(source, intent.extras)
+    val accelerator = SegmentedHttpCache(
+      cacheDir = cacheRoot,
+      connections = connections,
+      chunkBytes = chunkKb * 1024,
+      userAgent = requestHeaders.userAgentOrDefault(),
+      requestHeaders = requestHeaders,
+      systemProxy = resolveSystemHttpProxy(),
+      limitConnectionsUnderProxy = true,
+    )
+    val result = accelerator.open(source)
+    return if (result.usedSegmented) {
+      accelerator to result.playPath
+    } else {
+      accelerator.deleteCache()
+      null to null
+    }
+  }
+
+  private fun applyReopenedSegmentedCache(
+    source: String,
+    position: Int,
+    reopened: Pair<SegmentedHttpCache?, String?>,
+  ) {
+    val cache = reopened.first
+    val playPath = reopened.second
+    if (cache == null || playPath == null) {
+      PlaybackSessionLog.e(
+        "SEG",
+        "reconnect failed — multi-conn reopen unsuccessful " +
+          "src=${PlaybackSessionLog.redactUrl(source)}",
+      )
+      segmentedSourceUrl = source
+      segmentedReconnectInProgress = false
+      startSegmentedWatchdog()
+      return
+    }
+    PlaybackSessionLog.i(
+      "SEG",
+      "reconnect ok playPath=${PlaybackSessionLog.redactUrl(playPath)} seekTo=$position",
+    )
+    segmentedHttpCache = cache
+    segmentedSourceUrl = source
+    segmentedPendingSeek = position
+    playUri(playPath, useLoadfileCommand = true)
+    // The watchdog restarts after the reloaded file is actually loaded.
+    startSegmentedWatchdog()
   }
 
   private fun onSegmentedReloaded() {
