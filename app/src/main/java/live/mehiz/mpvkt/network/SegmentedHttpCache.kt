@@ -446,8 +446,9 @@ class SegmentedHttpCache(
       useHead: Boolean,
       systemProxy: SystemHttpProxy.Info? = null,
     ): ProbeResult {
+      val method = if (useHead) "HEAD" else "GET"
       val conn = openConnection(url, userAgent, requestHeaders.sanitizedForOrigin(), systemProxy).apply {
-        requestMethod = if (useHead) "HEAD" else "GET"
+        requestMethod = method
         if (!useHead) {
           setRequestProperty("Range", "bytes=0-0")
         }
@@ -480,11 +481,20 @@ class SegmentedHttpCache(
             ProbeResult(ok, len, type, finalUrl)
           }
           else -> {
+            PlaybackSessionLog.w(
+              "SEG",
+              "probe $method http=$code type=$type url=${PlaybackSessionLog.redactUrl(finalUrl)}",
+            )
             conn.disconnect()
             ProbeResult(false, -1L, type, finalUrl)
           }
         }
       } catch (e: Exception) {
+        PlaybackSessionLog.w(
+          "SEG",
+          "probe $method error=${e.javaClass.simpleName}:${e.message} " +
+            "url=${PlaybackSessionLog.redactUrl(url)}",
+        )
         runCatching { conn.disconnect() }
         ProbeResult(false, -1L, null, url)
       }

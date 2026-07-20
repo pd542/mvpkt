@@ -70,6 +70,7 @@ import live.mehiz.mpvkt.ui.player.controls.PlayerControls
 import live.mehiz.mpvkt.ui.theme.MpvKtTheme
 import org.koin.android.ext.android.inject
 import java.io.File
+import java.util.Locale
 
 @Suppress("TooManyFunctions", "LargeClass")
 class PlayerActivity : AppCompatActivity() {
@@ -297,13 +298,21 @@ class PlayerActivity : AppCompatActivity() {
 
   private fun playUri(uri: String, useLoadfileCommand: Boolean) {
     val isLocalProxy = uri.isLocalSegmentedProxy()
+    val isRemoteHttp = uri.startsWith("http://", ignoreCase = true) ||
+      uri.startsWith("https://", ignoreCase = true)
     applyMpvHttpProxyForUri(uri)
+    // Headers must be applied BEFORE the first network request.
+    // setIntentExtras() only runs on FILE_LOADED — too late for auth-gated Emby.
+    if (isRemoteHttp && !isLocalProxy) {
+      applyPlaybackHttpHeaders(uri, intent.extras)
+    }
     PlaybackSessionLog.i(
       "PLAY",
-      "load uri=${PlaybackSessionLog.redactUrl(uri)} localProxy=$isLocalProxy useLoadfile=$useLoadfileCommand",
+      "load uri=${PlaybackSessionLog.redactUrl(uri)} localProxy=$isLocalProxy " +
+        "useLoadfile=$useLoadfileCommand remoteHttp=$isRemoteHttp",
     )
-    // Local multi-conn proxy: always use loadfile so libmpv opens as network stream.
-    if (useLoadfileCommand || isLocalProxy) {
+    // Local multi-conn proxy / remote HTTP: always use loadfile so headers stick.
+    if (useLoadfileCommand || isLocalProxy || isRemoteHttp) {
       if (isLocalProxy) {
         // Help lavf treat progressive proxy as seekable http.
         runCatching { MPVLib.setOptionString("force-seekable", "yes") }
@@ -338,7 +347,7 @@ class PlayerActivity : AppCompatActivity() {
     val connections = networkPreferences.multiConnectionCount.get().coerceIn(2, 16)
     val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 4096)
     val cacheRoot = File(cacheDir, "segmented-http").also { it.mkdirs() }
-    val requestHeaders = intentHeaders(intent.extras)
+    val requestHeaders = playbackHttpHeaders(uri, intent.extras)
     val systemProxy = resolveSystemHttpProxy()
     val accelerator = SegmentedHttpCache(
       cacheDir = cacheRoot,
@@ -888,7 +897,20 @@ class PlayerActivity : AppCompatActivity() {
       }
     }
 
-    val headers = intentHeaders(extras)
+    // Keep headers in sync after FILE_LOADED (path may change via redirects).
+    val path = MPVLib.getPropertyString("path").orEmpty()
+    applyPlaybackHttpHeaders(path, extras)
+  }
+
+  /**
+   * Apply HTTP headers for Emby/Jellyfin and external clients **before** network open.
+   * Sources:
+   * 1. Intent extras `headers` (name/value pairs)
+   * 2. Query `api_key` / `X-Emby-Token` → `X-Emby-Token` header (common Emby stream URLs)
+   */
+  private fun applyPlaybackHttpHeaders(url: String, extras: Bundle?) {
+    val headers = playbackHttpHeaders(url, extras)
+    if (headers.isEmpty()) return
     headers.entries
       .firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }
       ?.let { MPVLib.setPropertyString("user-agent", it.value) }
@@ -896,7 +918,20 @@ class PlayerActivity : AppCompatActivity() {
       .filterKeys { !it.equals("User-Agent", ignoreCase = true) }
       .map { "${it.key}: ${it.value.replace(",", "\\,")}" }
       .joinToString(",")
-    if (headersString.isNotBlank()) MPVLib.setPropertyString("http-header-fields", headersString)
+    if (headersString.isNotBlank()) {
+      MPVLib.setPropertyString("http-header-fields", headersString)
+      PlaybackSessionLog.i(
+        "HTTP",
+        "headers applied keys=${headers.keys.joinToString()} " +
+          "url=${PlaybackSessionLog.redactUrl(url)}",
+      )
+    }
+  }
+
+  private fun playbackHttpHeaders(url: String, extras: Bundle?): Map<String, String> {
+    val headers = intentHeaders(extras).toMutableMap()
+    injectMediaServerAuthHeaders(url, headers)
+    return headers
   }
 
   private fun intentHeaders(extras: Bundle?): Map<String, String> {
@@ -905,6 +940,32 @@ class PlayerActivity : AppCompatActivity() {
       .chunked(2)
       .filter { it.size == 2 && it[0].isNotBlank() && it[1].isNotBlank() }
       .associate { it[0] to it[1] }
+  }
+
+  /**
+   * Emby stream URLs usually put the token in `api_key=` query only.
+   * Some servers still expect `X-Emby-Token` on the request; without it open fails
+   * immediately with END_FILE and no duration.
+   */
+  private fun injectMediaServerAuthHeaders(url: String, headers: MutableMap<String, String>) {
+    val lower = url.lowercase(Locale.US)
+    val looksLikeEmby = lower.contains("/emby/") ||
+      lower.contains("/jellyfin/") ||
+      lower.contains("mediasourceid=") ||
+      lower.contains("/videos/")
+    val uri = if (looksLikeEmby) runCatching { url.toUri() }.getOrNull() else null
+    val token = uri?.let { parsed ->
+      sequenceOf("api_key", "ApiKey", "X-Emby-Token", "apiKey")
+        .mapNotNull { key -> parsed.getQueryParameter(key)?.takeIf { it.isNotBlank() } }
+        .firstOrNull()
+    }
+    val hasTokenHeader = headers.keys.any {
+      it.equals("X-Emby-Token", ignoreCase = true) ||
+        it.equals("X-MediaBrowser-Token", ignoreCase = true)
+    }
+    if (looksLikeEmby && token != null && !hasTokenHeader) {
+      headers["X-Emby-Token"] = token
+    }
   }
 
   private fun Map<String, String>.userAgentOrDefault(): String =
