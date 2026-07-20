@@ -510,10 +510,13 @@ class PlayerActivity : AppCompatActivity() {
         val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 4096)
         val cacheRoot = File(cacheDir, "segmented-http").also { it.mkdirs() }
         val systemProxy = resolveSystemHttpProxy()
+        val requestHeaders = playbackHttpHeaders(source, intent.extras)
         val accelerator = SegmentedHttpCache(
           cacheDir = cacheRoot,
           connections = connections,
           chunkBytes = chunkKb * 1024,
+          userAgent = requestHeaders.userAgentOrDefault(),
+          requestHeaders = requestHeaders,
           systemProxy = systemProxy,
           limitConnectionsUnderProxy = true,
         )
