@@ -6,11 +6,17 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.input.TextFieldLineLimits
 import androidx.compose.foundation.text.input.rememberTextFieldState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.FolderOpen
@@ -38,6 +44,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
 import androidx.core.net.toUri
 import com.github.k1rakishou.fsaf.FileManager
 import `is`.xyz.mpv.Utils.PROTOCOLS
@@ -74,72 +81,93 @@ object HomeScreen : Screen {
         )
       },
     ) { padding ->
-      Column(
+      // Scrollable so a very long pasted URL cannot push "Open url" off-screen.
+      Box(
         modifier = Modifier
           .fillMaxSize()
           .padding(padding),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
       ) {
-        val uri = rememberTextFieldState()
-        var isUrlValid by remember { mutableStateOf(true) }
-        LaunchedEffect(uri.text) {
-          isUrlValid = uri.text.isNotEmpty() || isURLValid(uri.text.toString())
-        }
-        OutlinedTextField(
-          state = uri,
-          label = { Text(stringResource(R.string.home_url_input_label)) },
-          supportingText = {
-            Text(if (isUrlValid) "" else stringResource(R.string.home_invalid_protocol))
-          },
-          trailingIcon = {
-            if (!isUrlValid) Icon(Icons.Filled.Info, null)
-          },
-          isError = !isUrlValid
-        )
-        Button(
-          onClick = { playFile(uri.text.toString(), context) },
-          enabled = uri.text.isNotBlank() && isUrlValid,
+        Column(
+          modifier = Modifier
+            .align(Alignment.Center)
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = MaterialTheme.spacing.medium)
+            .padding(vertical = MaterialTheme.spacing.small),
+          horizontalAlignment = Alignment.CenterHorizontally,
+          verticalArrangement = Arrangement.spacedBy(MaterialTheme.spacing.small),
         ) {
-          Row(
-            horizontalArrangement = Arrangement.spacedBy(MaterialTheme.spacing.smaller),
-            verticalAlignment = Alignment.CenterVertically,
-          ) {
-            Icon(Icons.Default.Link, null)
-            Text(text = stringResource(R.string.home_open_url))
+          val uri = rememberTextFieldState()
+          var isUrlValid by remember { mutableStateOf(true) }
+          LaunchedEffect(uri.text) {
+            val text = uri.text.toString()
+            isUrlValid = text.isBlank() || isURLValid(text)
           }
-        }
-        val documentPicker = rememberLauncherForActivityResult(
-          ActivityResultContracts.OpenDocument(),
-        ) {
-          if (it == null) return@rememberLauncherForActivityResult
-          playFile(it.toString(), context)
-        }
-        OutlinedButton(
-          onClick = { documentPicker.launch(arrayOf("*/*")) },
-        ) {
-          Row(
-            horizontalArrangement = Arrangement.spacedBy(MaterialTheme.spacing.smaller),
-            verticalAlignment = Alignment.CenterVertically,
+          OutlinedTextField(
+            state = uri,
+            modifier = Modifier
+              .fillMaxWidth()
+              // Cap height so a long Emby/CDN URL cannot push action buttons off-screen.
+              .heightIn(min = 56.dp, max = 160.dp),
+            lineLimits = TextFieldLineLimits.MultiLine(maxHeightInLines = 6),
+            label = { Text(stringResource(R.string.home_url_input_label)) },
+            supportingText = {
+              Text(if (isUrlValid) "" else stringResource(R.string.home_invalid_protocol))
+            },
+            trailingIcon = {
+              if (!isUrlValid) Icon(Icons.Filled.Info, null)
+            },
+            isError = !isUrlValid,
+          )
+          Button(
+            onClick = { playFile(uri.text.toString(), context) },
+            enabled = uri.text.isNotBlank() && isUrlValid,
+            modifier = Modifier.fillMaxWidth(),
           ) {
-            Icon(Icons.Default.FileOpen, null)
-            Text(text = stringResource(R.string.home_pick_file))
+            Row(
+              horizontalArrangement = Arrangement.spacedBy(MaterialTheme.spacing.smaller),
+              verticalAlignment = Alignment.CenterVertically,
+            ) {
+              Icon(Icons.Default.Link, null)
+              Text(text = stringResource(R.string.home_open_url))
+            }
           }
-        }
-        val fileManager = FileManager(context)
-        val directoryPicker = rememberLauncherForActivityResult(
-          ActivityResultContracts.OpenDocumentTree(),
-        ) {
-          if (it == null) return@rememberLauncherForActivityResult
-          backstack.add(FilePickerScreen(fileManager.fromUri(it)!!.getFullPath()))
-        }
-        OutlinedButton(onClick = { directoryPicker.launch(null) }) {
-          Row(
-            horizontalArrangement = Arrangement.spacedBy(MaterialTheme.spacing.smaller),
-            verticalAlignment = Alignment.CenterVertically,
+          val documentPicker = rememberLauncherForActivityResult(
+            ActivityResultContracts.OpenDocument(),
           ) {
-            Icon(Icons.Default.FolderOpen, null)
-            Text(text = stringResource(R.string.home_open_file_picker))
+            if (it == null) return@rememberLauncherForActivityResult
+            playFile(it.toString(), context)
+          }
+          OutlinedButton(
+            onClick = { documentPicker.launch(arrayOf("*/*")) },
+            modifier = Modifier.fillMaxWidth(),
+          ) {
+            Row(
+              horizontalArrangement = Arrangement.spacedBy(MaterialTheme.spacing.smaller),
+              verticalAlignment = Alignment.CenterVertically,
+            ) {
+              Icon(Icons.Default.FileOpen, null)
+              Text(text = stringResource(R.string.home_pick_file))
+            }
+          }
+          val fileManager = FileManager(context)
+          val directoryPicker = rememberLauncherForActivityResult(
+            ActivityResultContracts.OpenDocumentTree(),
+          ) {
+            if (it == null) return@rememberLauncherForActivityResult
+            backstack.add(FilePickerScreen(fileManager.fromUri(it)!!.getFullPath()))
+          }
+          OutlinedButton(
+            onClick = { directoryPicker.launch(null) },
+            modifier = Modifier.fillMaxWidth(),
+          ) {
+            Row(
+              horizontalArrangement = Arrangement.spacedBy(MaterialTheme.spacing.smaller),
+              verticalAlignment = Alignment.CenterVertically,
+            ) {
+              Icon(Icons.Default.FolderOpen, null)
+              Text(text = stringResource(R.string.home_open_file_picker))
+            }
           }
         }
       }
