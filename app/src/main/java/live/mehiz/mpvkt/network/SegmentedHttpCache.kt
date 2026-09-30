@@ -29,7 +29,6 @@ import java.util.TreeMap
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
-import java.util.concurrent.Future
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
@@ -1058,6 +1057,19 @@ class SegmentedHttpCache(
 
     /**
      * Download [from, endExclusive) with up to N parallel Range requests.
+     *
+     * Sliding-window ("pipelined") scheduler: whenever a slot frees up we start the
+     * next slice immediately, instead of dispatching a fixed batch and blocking
+     * until every member of that batch finishes.
+     *
+     * The old batch form was the main cause of the sawtooth throughput users see as
+     * "loads fast, then crawls": `jobs.forEach { it.get() }` waited for the *slowest*
+     * slice, so one stalled Range GET left the other N-1 connections idle. With a
+     * 3x-slow outlier that averages ~1/3 of ideal, and it gets worse as the worker
+     * count grows — which is why raising connections from 8 to 16 made things
+     * slower rather than faster. Keeping every connection busy hides per-request
+     * jitter (proxy RTT, Emby-side scheduling) instead of amplifying it.
+     *
      * @return true if any progress was made or region already covered
      */
     private fun fillWindowParallel(from: Long, endExclusive: Long, deadline: Long): Boolean {
@@ -1066,40 +1078,61 @@ class SegmentedHttpCache(
       if (store.isFullyCovered(from, end)) return true
       val chunk = config.chunkBytes.toLong()
       val workers = config.connections.coerceIn(2, 12)
-      val jobs = ArrayList<Future<*>>(workers)
       var pos = from
       var scheduled = 0
       val genAtStart = priorityGen.get()
-      while (pos < end && scheduled < workers) {
-        if (!running.get()) break
-        // Stop scheduling more slices if a real seek superseded this window.
-        if (priorityGen.get() != genAtStart) {
-          val ps = priorityStart.get()
-          val pe = priorityEnd.get()
-          val overlaps = ps >= 0L && pos < pe && (pos + chunk) > ps
-          if (!overlaps) break
-        }
-        val already = store.contiguousFrom(pos)
-        if (already > 0) {
-          pos += already
-          continue
-        }
-        val rangeEnd = min(end, pos + chunk) - 1
-        if (rangeEnd < pos) break
-        val start = pos
-        val stop = rangeEnd
-        pos = rangeEnd + 1
-        scheduled++
-        jobs += scheduleRangeDownload(start, stop)
+      // In-flight slices, kept short (a handful of entries) so the poll below stays cheap.
+      val inflight = ArrayList<CompletableFuture<Boolean>>(workers)
+
+      /** True while this fill still owns the area around [offset]. */
+      fun stillWanted(offset: Long): Boolean {
+        if (!running.get()) return false
+        if (priorityGen.get() == genAtStart) return true
+        // A real seek superseded this window: keep going only if the new window
+        // still covers the slice we are about to start.
+        val ps = priorityStart.get()
+        val pe = priorityEnd.get()
+        return ps >= 0L && offset < pe && (offset + chunk) > ps
       }
-      if (jobs.isEmpty()) {
+
+      while (true) {
+        if (System.currentTimeMillis() >= deadline) break
+        if (!stillWanted(pos)) break
+        // Top up every free slot rather than refilling only after the whole batch ends.
+        while (inflight.size < workers && pos < end) {
+          if (!stillWanted(pos)) break
+          val already = store.contiguousFrom(pos)
+          if (already > 0) {
+            pos += already
+            continue
+          }
+          val rangeEnd = min(end, pos + chunk) - 1
+          if (rangeEnd < pos) break
+          val start = pos
+          pos = rangeEnd + 1
+          scheduled++
+          inflight += scheduleRangeDownload(start, rangeEnd)
+        }
+        if (inflight.isEmpty()) break
+        // Wait for *any* completion (not all), then reclaim finished slots.
+        // Never cancel in-flight Range GETs — cancelling them was the main reason
+        // multi-conn "stopped working" after the anti-stall patch.
+        val waitMs = (deadline - System.currentTimeMillis()).coerceIn(20L, 1_000L)
+        runCatching {
+          CompletableFuture.anyOf(*inflight.toTypedArray())
+            .get(waitMs, TimeUnit.MILLISECONDS)
+        }
+        inflight.removeAll { it.isDone }
+      }
+
+      if (scheduled == 0) {
         return store.contiguousFrom(from) > 0 || store.isFullyCovered(from, end)
       }
-      // Wait for progress, but NEVER cancel in-flight Range GETs — cancelling them
-      // was the main reason multi-conn "stopped working" after the anti-stall patch.
-      val waitMs = (deadline - System.currentTimeMillis()).coerceIn(100L, 6_000L)
-      jobs.forEach { f ->
-        runCatching { f.get(waitMs, TimeUnit.MILLISECONDS) }
+      // Let already-running slices finish rather than abandoning them; they are
+      // bounded by the per-connection read timeout.
+      val drainMs = (deadline - System.currentTimeMillis()).coerceIn(0L, 2_000L)
+      inflight.forEach { f ->
+        runCatching { f.get(drainMs, TimeUnit.MILLISECONDS) }
       }
       return store.contiguousFrom(from) > 0 || store.isFullyCovered(from, end)
     }
@@ -1212,32 +1245,51 @@ class SegmentedHttpCache(
           if (leadHave <= 0L) continue
         }
 
-        val jobs = ArrayList<Future<*>>(stripe)
+        // Sliding-window ("pipelined") stripe fill.
+        //
+        // Previously this dispatched `stripe` slices and then blocked in
+        // `jobs.forEach { it.get(30s) }` until *every* one of them finished, so a
+        // single slow slice idled the whole stripe. That is the same sawtooth the
+        // priority path above used to have: throughput collapses to one connection's
+        // worth while the rest wait, then recovers in a burst. Refill each free slot
+        // as soon as it frees up so every connection stays busy and per-request
+        // jitter is absorbed instead of amplified.
+        val inflight = ArrayList<CompletableFuture<Boolean>>(stripe)
         var stripePos = pos
         val genAtSchedule = priorityGen.get()
         val stripeCeiling = schedulerCeiling()
-        repeat(stripe) {
-          if (stripePos >= config.totalSize) return@repeat
-          if (stripePos >= stripeCeiling) return@repeat
-          val skip = store.contiguousFrom(stripePos)
-          if (skip > 0) {
-            stripePos += skip
-            return@repeat
-          }
-          val start = stripePos
-          val end = min(min(config.totalSize, stripeCeiling), start + chunk) - 1
-          stripePos = end + 1
-          jobs += scheduleRangeDownload(start, end) {
-            // Skip only if a real seek happened after schedule and this slice is
-            // far from the new playhead — do not drop work for progressive reads.
-            if (priorityGen.get() != genAtSchedule) {
-              val p = activePriorityWindow()
-              if (p != null && (end < p.first || start > p.second)) return@scheduleRangeDownload false
+        val stripeDeadline = System.currentTimeMillis() + 30_000L
+        while (true) {
+          while (inflight.size < stripe && stripePos < config.totalSize && stripePos < stripeCeiling) {
+            val skip = store.contiguousFrom(stripePos)
+            if (skip > 0) {
+              stripePos += skip
+              continue
             }
-            true
+            val start = stripePos
+            val end = min(min(config.totalSize, stripeCeiling), start + chunk) - 1
+            if (end < start) break
+            stripePos = end + 1
+            inflight += scheduleRangeDownload(start, end) {
+              // Skip only if a real seek happened after schedule and this slice is
+              // far from the new playhead — do not drop work for progressive reads.
+              if (priorityGen.get() != genAtSchedule) {
+                val p = activePriorityWindow()
+                if (p != null && (end < p.first || start > p.second)) return@scheduleRangeDownload false
+              }
+              true
+            }
           }
+          if (inflight.isEmpty()) break
+          val waitMs = (stripeDeadline - System.currentTimeMillis()).coerceIn(20L, 1_000L)
+          runCatching {
+            CompletableFuture.anyOf(*inflight.toTypedArray())
+              .get(waitMs, TimeUnit.MILLISECONDS)
+          }
+          inflight.removeAll { it.isDone }
+          if (System.currentTimeMillis() >= stripeDeadline) break
         }
-        if (jobs.isEmpty()) {
+        if (stripePos <= pos && store.contiguousFrom(pos) <= 0) {
           var scan = pos
           while (scan < config.totalSize && store.contiguousFrom(scan) > 0) {
             scan += store.contiguousFrom(scan)
@@ -1249,9 +1301,6 @@ class SegmentedHttpCache(
             pos = scan
           }
           continue
-        }
-        jobs.forEach { f ->
-          runCatching { f.get(30, TimeUnit.SECONDS) }
         }
         val progressed = store.contiguousFrom(pos)
         if (progressed <= 0) {
@@ -1275,7 +1324,7 @@ class SegmentedHttpCache(
       start: Long,
       endInclusive: Long,
       shouldRun: () -> Boolean = { true },
-    ): Future<Boolean> {
+    ): CompletableFuture<Boolean> {
       if (store.isFullyCovered(start, endInclusive + 1)) {
         return CompletableFuture.completedFuture(true)
       }
@@ -1322,6 +1371,9 @@ class SegmentedHttpCache(
     /** One Range GET attempt. Returns null on success, error message on failure. */
     private fun downloadRangeAttempt(start: Long, end: Long): String? {
       var conn: HttpURLConnection? = null
+      // Tracks whether the exchange ended in a usable state. Only a fully consumed
+      // body leaves the socket safe to return to the keep-alive pool.
+      var reusable = false
       return try {
         conn = openConnection(
           config.originUrl,
@@ -1349,7 +1401,7 @@ class SegmentedHttpCache(
             "Range ignored at $start (HTTP 200)"
           }
           else -> {
-            val wrote = writeStreamToFile(conn.inputStream, start, end)
+            val wrote = writeStreamToFile(conn.inputStream, start, end) { reusable = true }
             if (wrote > 0 || store.isFullyCovered(start, end + 1)) {
               // Contiguous tip progress proves the server produced up to here, so
               // the watermark may advance. (Only ever moves forward.)
@@ -1365,7 +1417,19 @@ class SegmentedHttpCache(
       } catch (e: Exception) {
         e.message ?: e.javaClass.simpleName
       } finally {
-        runCatching { conn?.disconnect() }
+        // Keep the socket alive on the happy path so the JVM's KeepAliveCache can
+        // hand it to the next Range GET. Calling disconnect() unconditionally made
+        // the "Connection: keep-alive" header above a no-op: every slice paid a
+        // fresh TCP + proxy handshake, which on a 60-150 ms RTT tunnel is 20-35% of
+        // the slice's wall time spent transferring nothing. That is the mechanical
+        // cause of throughput oscillating between "fine" and "stalled".
+        //
+        // Tear the connection down whenever the exchange did not finish cleanly:
+        // on error/timeout the socket is unusable, and returning it to the pool
+        // would hand a poisoned connection to the next caller.
+        if (!reusable) {
+          runCatching { conn?.disconnect() }
+        }
       }
     }
 
@@ -1396,7 +1460,22 @@ class SegmentedHttpCache(
     }
 
     /** @return number of bytes written */
-    private fun writeStreamToFile(stream: InputStream, start: Long, endInclusive: Long): Long {
+    /**
+     * Streams a Range body into the cache file.
+     *
+     * @param onBodyConsumed invoked when the response body reached EOF, i.e. the
+     *   socket is drained and `HttpURLConnection` may legally return it to the
+     *   keep-alive pool. It is *not* invoked when we stop early at [endInclusive]
+     *   (one buffer of trailing bytes is still unread) or when playback is torn
+     *   down mid-read, because in both cases a pooled connection would hand
+     *   leftover body bytes to the next request.
+     */
+    private fun writeStreamToFile(
+      stream: InputStream,
+      start: Long,
+      endInclusive: Long,
+      onBodyConsumed: () -> Unit = {},
+    ): Long {
       val input = BufferedInputStream(stream, 64 * 1024)
       val buf = ByteArray(64 * 1024)
       var writePos = start
@@ -1404,7 +1483,10 @@ class SegmentedHttpCache(
       try {
         while (running.get() && writePos <= endInclusive) {
           val n = input.read(buf)
-          if (n < 0) break
+          if (n < 0) {
+            onBodyConsumed()
+            break
+          }
           val maxWrite = (endInclusive + 1 - writePos).toInt()
           if (maxWrite <= 0) break
           val w = min(n, maxWrite)
@@ -1421,6 +1503,11 @@ class SegmentedHttpCache(
           lastWriteAtMs.set(System.currentTimeMillis())
           store.mark(from, writePos)
         }
+        // We asked for exactly `endInclusive + 1 - start` bytes. If the response
+        // delivered every one of them, there is nothing left in flight worth
+        // draining: the connection is safe to pool. (Servers that send a slightly
+        // longer body fall through to the buffered case and get disconnected.)
+        if (written >= endInclusive + 1 - start) onBodyConsumed()
       } finally {
         runCatching { input.close() }
       }
