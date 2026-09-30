@@ -88,6 +88,17 @@ class SegmentedHttpCache(
   private val allowTranscode: Boolean = false,
   /** Hard cap applied when a real system HTTP proxy is in use (0 = no extra cap). */
   private val proxyConnCap: Int = 0,
+  /**
+   * How many bytes ahead of the playhead the scheduler should keep prioritised,
+   * in bytes. `0` keeps the conservative built-in default (see
+   * [DEFAULT_READ_AHEAD_BYTES]).
+   *
+   * This is what actually fills mpv's demux cache: work inside
+   * `[playhead, playhead + readAheadBytes)` is pinned and will not be abandoned,
+   * while anything past it is opportunistic. Size it from (and at or below) the
+   * demuxer byte budget so the downloader and the player agree on the target.
+   */
+  private val readAheadBytes: Long = 0L,
 ) {
   private var session: Session? = null
 
@@ -205,6 +216,7 @@ class SegmentedHttpCache(
         requestHeaders = requestHeaders,
         systemProxy = systemProxy,
         transcodeMode = transcode,
+        readAheadBytes = readAheadBytes,
       ),
       cacheDir = cacheDir,
       log = {},
@@ -281,8 +293,28 @@ class SegmentedHttpCache(
     /** Cap a single ensureRange wait (proxy must not freeze mpv for a full minute). */
     private const val MAX_ENSURE_TIMEOUT_MS = 12_000L
 
-    /** Max playhead priority window size (bytes). */
-    private const val MAX_PRIORITY_AHEAD = 8L * 1024L * 1024L
+    /**
+     * Default playhead read-ahead window (bytes) when the caller does not size one.
+     *
+     * 8 MiB is deliberately small: it matches the historical behaviour so callers
+     * that have not opted in (and low-memory devices) are unaffected. Callers that
+     * set `demuxer-max-bytes` should pass a comparable value — see
+     * [SessionConfig.readAheadBytes].
+     */
+    private const val DEFAULT_READ_AHEAD_BYTES = 8L * 1024L * 1024L
+
+    /** Floor for a caller-supplied read-ahead window (bytes). */
+    private const val MIN_READ_AHEAD_BYTES = 4L * 1024L * 1024L
+
+    /**
+     * Ceiling for a caller-supplied read-ahead window (bytes).
+     *
+     * Bounded well below the demuxer budget: the priority window pins work the
+     * scheduler will not abandon, so a huge window on a slow link just means the
+     * downloader commits to bytes far past the playhead while the player starves.
+     * 512 MiB is the largest window we consider useful on a 8 GB device.
+     */
+    private const val MAX_READ_AHEAD_BYTES = 512L * 1024L * 1024L
 
     /** Prefer asking for at least this many bytes ahead of the read cursor. */
     private const val MIN_STREAM_BYTES = 512L * 1024L
@@ -697,6 +729,16 @@ class SegmentedHttpCache(
      * actually produced. [Session.producedWatermark] tracks that boundary.
      */
     val transcodeMode: Boolean = false,
+    /**
+     * How many bytes ahead of the playhead the priority window should cover.
+     *
+     * This is what actually fills mpv's demux cache. With the old fixed 8 MiB the
+     * window only ever covered "what mpv needs right now", so `demuxer-max-bytes`
+     * stayed empty (`demuxCacheSec=0.0`) and any network dip caused an instant
+     * rebuffer. Sized from the user's demuxer byte budget so the front-end
+     * downloader and the back-end cache describe the same target.
+     */
+    val readAheadBytes: Long = DEFAULT_READ_AHEAD_BYTES,
   )
 
   private class Session(
@@ -798,6 +840,29 @@ class SegmentedHttpCache(
      * **not** bump [priorityGen] or in-flight Range jobs get cancelled/ignored and
      * multi-conn appears "broken". Only real seeks bump the generation.
      */
+
+    /**
+     * The caller's requested window, or the default when they passed nothing /
+     * a non-positive value (0 = "keep the built-in behaviour").
+     */
+    private val requestedReadAheadBytes: Long =
+      if (config.readAheadBytes > 0) config.readAheadBytes else DEFAULT_READ_AHEAD_BYTES
+
+    /** Clamped, enforcible playhead read-ahead target in bytes. */
+    private fun readAheadBytes(): Long =
+      requestedReadAheadBytes.coerceIn(MIN_READ_AHEAD_BYTES, MAX_READ_AHEAD_BYTES)
+
+    /**
+     * End of the playhead priority window starting at [from].
+     *
+     * Never shorter than a few chunks (so a tiny read-ahead cannot starve the
+     * scheduler) and never past EOF.
+     */
+    private fun readAheadEnd(from: Long): Long {
+      val target = maxOf(readAheadBytes(), config.chunkBytes.toLong() * 4L)
+      return min(config.totalSize, from + target)
+    }
+
     fun setPlayheadPriority(start: Long, endExclusive: Long) {
       val s = start.coerceAtLeast(0L)
       val e = min(endExclusive, config.totalSize).coerceAtLeast(s)
@@ -844,7 +909,7 @@ class SegmentedHttpCache(
     fun ensureRange(start: Long, endExclusive: Long, timeoutMs: Long): Boolean {
       val end = min(endExclusive, config.totalSize)
       if (start >= end) return true
-      setPlayheadPriority(start, min(end + config.chunkBytes.toLong(), start + MAX_PRIORITY_AHEAD))
+      setPlayheadPriority(start, readAheadEnd(start))
       val cappedTimeout = timeoutMs.coerceIn(500L, MAX_ENSURE_TIMEOUT_MS)
       val deadline = System.currentTimeMillis() + cappedTimeout
       var spins = 0
@@ -1259,7 +1324,7 @@ class SegmentedHttpCache(
             SEEK_START_BYTES
           }
           val firstSliceEnd = min(to + 1, from + firstSliceBytes)
-          setPlayheadPriority(from, min(config.totalSize, from + MAX_PRIORITY_AHEAD))
+          setPlayheadPriority(from, readAheadEnd(from))
           val pre = ensureRange(from, firstSliceEnd, 8_000L)
           log("proxy 206 $from-$to firstSlice=$pre need=${firstSliceEnd - from}")
           // Only fail hard when we truly have nothing at the request start.
@@ -1318,7 +1383,7 @@ class SegmentedHttpCache(
         // Only abort after sustained no-progress (idleRounds). Closing early with a
         // declared Content-Length causes lavf to treat the short body as real EOF
         // mid-movie (false eof-reached while pos << duration).
-        val ahead = maxOf(config.chunkBytes.toLong() * 4L, MAX_PRIORITY_AHEAD)
+        val ahead = readAheadBytes()
         while (remaining > 0 && running.get()) {
           val want = min(buf.size.toLong(), remaining).toInt()
           val needEnd = min(

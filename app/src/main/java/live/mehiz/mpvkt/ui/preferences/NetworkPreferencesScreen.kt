@@ -316,6 +316,24 @@ object NetworkPreferencesScreen : Screen {
             sliderValue = multiConnectionCountFloat,
           )
 
+          val readAheadMb by preferences.readAheadMb.collectAsState()
+          val readAheadMbFloat = readAheadMb.toFloat()
+          SliderPreference(
+            value = readAheadMbFloat,
+            onValueChange = { value ->
+              preferences.readAheadMb.set(value.roundToInt().coerceIn(0, 512))
+            },
+            title = { Text(stringResource(R.string.pref_network_read_ahead)) },
+            valueRange = 0f..512f,
+            summary = {
+              Text(stringResource(R.string.pref_network_value_mb, readAheadMb))
+            },
+            onSliderValueChange = { value ->
+              preferences.readAheadMb.set(value.roundToInt().coerceIn(0, 512))
+            },
+            sliderValue = readAheadMbFloat,
+          )
+
           val multiConnectionChunkKb by preferences.multiConnectionChunkKb.collectAsState()
           val multiConnectionChunkKbFloat = multiConnectionChunkKb.toFloat()
           SliderPreference(

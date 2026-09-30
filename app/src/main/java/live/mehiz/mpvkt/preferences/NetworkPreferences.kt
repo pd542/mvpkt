@@ -109,6 +109,21 @@ class NetworkPreferences(preferenceStore: PreferenceStore) {
   // New key so previous broken defaults are not reused.
   val multiConnectionDownload = preferenceStore.getBoolean("network_multi_connection_download_v3", true)
 
+  /**
+   * Prefetch window ahead of the playhead, in MiB, for the multi-connection
+   * downloader.
+   *
+   * This is what actually lets mpv's demux cache fill up. The downloader only
+   * prioritises work inside `[playhead, playhead + this]`; everything past it is
+   * opportunistic. With the old fixed 8 MiB the window only ever covered what mpv
+   * needed immediately, so `demuxer-max-bytes` stayed empty (`demuxCacheSec=0.0`)
+   * and any network dip caused an instant rebuffer.
+   *
+   * Keep it <= [demuxerMaxCacheMb] so the front-end and back-end targets agree.
+   * 0 disables the extended prefetch (falls back to ~8 MiB, the old behaviour).
+   */
+  val readAheadMb = preferenceStore.getInt("network_read_ahead_mb", 192)
+
   /** Parallel connections for multi-connection download (2–16). */
   val multiConnectionCount = preferenceStore.getInt("network_multi_connection_count", 8)
 

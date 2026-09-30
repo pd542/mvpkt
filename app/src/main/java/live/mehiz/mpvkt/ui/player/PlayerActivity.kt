@@ -342,6 +342,19 @@ class PlayerActivity : AppCompatActivity() {
    * Returns a localhost proxy URL when segmented mode is active,
    * otherwise the original remote URL.
    */
+  /**
+   * Prefetch window handed to [SegmentedHttpCache], derived from the same byte
+   * budget that configures mpv's demuxer so the two cannot disagree.
+   *
+   * `0` (or a value below the downloader's floor) falls back to the built-in
+   * default, which preserves the old single-chunk-ish behaviour.
+   */
+  private fun readAheadBytes(): Long {
+    val mb = networkPreferences.readAheadMb.get()
+    if (mb <= 0) return 0L
+    return mb.toLong() * 1024L * 1024L
+  }
+
   private fun maybeAccelerateHttp(uri: String): String {
     if (!shouldUseSegmentedDownload(uri)) return uri
 
@@ -369,6 +382,7 @@ class PlayerActivity : AppCompatActivity() {
       limitConnectionsUnderProxy = true,
       allowTranscode = allowTranscode,
       proxyConnCap = proxyCap,
+      readAheadBytes = readAheadBytes(),
     )
     val result = accelerator.open(uri)
     return if (result.usedSegmented) {
@@ -546,6 +560,7 @@ class PlayerActivity : AppCompatActivity() {
       limitConnectionsUnderProxy = true,
       allowTranscode = allowTranscode,
       proxyConnCap = proxyCap,
+      readAheadBytes = readAheadBytes(),
     )
     val result = accelerator.open(source)
     return if (result.usedSegmented) {
