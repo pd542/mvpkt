@@ -28,6 +28,7 @@ import java.util.Locale
 import java.util.TreeMap
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -1104,10 +1105,7 @@ class SegmentedHttpCache(
         // Never cancel in-flight Range GETs — cancelling them was the main reason
         // multi-conn "stopped working" after the anti-stall patch.
         val waitMs = (deadline - System.currentTimeMillis()).coerceIn(20L, 1_000L)
-        runCatching {
-          CompletableFuture.anyOf(*inflight.toTypedArray())
-            .get(waitMs, TimeUnit.MILLISECONDS)
-        }
+        awaitAny(inflight, waitMs)
         inflight.removeAll { it.isDone }
       }
 
@@ -1126,6 +1124,28 @@ class SegmentedHttpCache(
     /** Mutable scheduling cursor shared by the window loops. */
     private class WindowCursor(var pos: Long) {
       var scheduled = 0
+    }
+
+    /**
+     * Block until any future in [futures] completes, or [waitMs] elapses.
+     *
+     * Deliberately avoids `CompletableFuture.anyOf(*futures.toTypedArray())`:
+     *   * the spread operator force-copies the whole array on every call, which
+     *     detekt flags (SpreadOperator) and which this hot path calls once per
+     *     scheduling round;
+     *   * `anyOf` has no Collection overload, only varargs, so the spread is not
+     *     avoidable if we go through it.
+     * A latch is the cheaper and clearer primitive here: whoever finishes first
+     * trips it, and the caller polls the same way it did before.
+     */
+    private fun awaitAny(futures: List<CompletableFuture<Boolean>>, waitMs: Long) {
+      if (futures.isEmpty()) return
+      if (futures.any { it.isDone }) return
+      val anyDone = CountDownLatch(1)
+      futures.forEach { f ->
+        f.whenComplete { _, _ -> anyDone.countDown() }
+      }
+      runCatching { anyDone.await(waitMs, TimeUnit.MILLISECONDS) }
     }
 
     /**
@@ -1304,10 +1324,7 @@ class SegmentedHttpCache(
           }
           if (inflight.isEmpty()) break
           val waitMs = (stripeDeadline - System.currentTimeMillis()).coerceIn(20L, 1_000L)
-          runCatching {
-            CompletableFuture.anyOf(*inflight.toTypedArray())
-              .get(waitMs, TimeUnit.MILLISECONDS)
-          }
+          awaitAny(inflight, waitMs)
           inflight.removeAll { it.isDone }
           if (System.currentTimeMillis() >= stripeDeadline) break
         }
