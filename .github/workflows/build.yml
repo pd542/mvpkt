@@ -9,7 +9,10 @@ on:
       - "perf/**"
     tags-ignore:
       - "v*"
+  workflow_dispatch:
 
+# Single build per branch/PR: a new push cancels the previous in-flight run.
+# (Nightly/release workflows have their own triggers and do not run on perf branches.)
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
