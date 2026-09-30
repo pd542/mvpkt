@@ -219,7 +219,14 @@ class SegmentedHttpCache(
         readAheadBytes = readAheadBytes,
       ),
       cacheDir = cacheDir,
-      log = {},
+      // Route the segment cache's internal diagnostics to the playback session log.
+      //
+      // This used to be `log = {}` -- an empty lambda. The class has ~24 log()
+      // call sites, so every one of them was silently discarded: no session-start
+      // line, no re-anchor proof, no spin diagnostics. That made field logs
+      // impossible to act on, because a starved playhead and a slow link look
+      // identical when neither reports anything.
+      log = { PlaybackSessionLog.d("SEGX", it) },
     )
 
     PlaybackSessionLog.i(
@@ -767,6 +774,23 @@ class SegmentedHttpCache(
     private val inFlightRanges = ConcurrentHashMap<String, CompletableFuture<Boolean>>()
 
     /**
+     * Rate limit for the per-iteration / per-request diagnostics.
+     *
+     * The playback log is written synchronously to a file with a flush on every
+     * line, and `ensureRange` can spin thousands of times a second while the
+     * playhead is starved. Logging every spin would both flood the log and slow
+     * down the very loop we are trying to measure. One line per key per second is
+     * plenty to reconstruct what happened.
+     */
+    private val lastLogAtMs = ConcurrentHashMap<String, Long>()
+
+    private fun logThrottled(key: String, message: () -> String) {
+      val now = System.currentTimeMillis()
+      val prev = lastLogAtMs.put(key, now)
+      if (prev == null || now - prev >= 1_000L) log(message())
+    }
+
+    /**
      * Playback/seek head — background filler yields to this region first.
      * [priorityGen] invalidates stale windows after rapid seeks so old targets
      * cannot monopolize all download workers forever.
@@ -1016,10 +1040,10 @@ class SegmentedHttpCache(
         // actually is. Without this, a stalled playhead is indistinguishable from a
         // slow link in the log.
         if (spins in 1..2 && nowHave < end - start) {
-          log(
+          logThrottled("ensureRange") {
             "ensureRange spin=$spins start=$start end=$end have=$nowHave " +
-              "hole=$holeStart windowEnd=$windowEnd chunks=$windowChunks filled=$filled",
-          )
+              "hole=$holeStart windowEnd=$windowEnd chunks=$windowChunks filled=$filled"
+          }
         }
         if (start + nowHave >= end) return true
       }
@@ -1454,7 +1478,11 @@ class SegmentedHttpCache(
           val firstSliceEnd = min(to + 1, from + firstSliceBytes)
           setPlayheadPriority(from, readAheadEnd(from))
           val pre = ensureRange(from, firstSliceEnd, 8_000L)
-          log("proxy 206 $from-$to firstSlice=$pre need=${firstSliceEnd - from}")
+          // Per-request line, but mpv issues these in bursts: throttle to one per
+          // second so a seek storm does not bury the more useful spin diagnostics.
+          logThrottled("proxy206") {
+            "proxy 206 $from-$to firstSlice=$pre need=${firstSliceEnd - from}"
+          }
           // Only fail hard when we truly have nothing at the request start.
           // Returning 503 too eagerly made multi-conn look completely broken.
           if (store.contiguousFrom(from) <= 0L && !isHead) {
