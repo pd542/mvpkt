@@ -1027,13 +1027,26 @@ class SegmentedHttpCache(
           val holeStart = pStart + store.contiguousFrom(pStart)
           if (holeStart < pEnd) {
             val deadline = System.currentTimeMillis() + 10_000L
-            fillWindowParallel(holeStart, pEnd, deadline)
-            if (store.contiguousFrom(pStart) + pStart < pEnd) {
-              // Still sparse — keep hammering the playhead, do not waste workers on tip.
+            val filled = fillWindowParallel(holeStart, pEnd, deadline)
+            // Do NOT spin here until the whole window is contiguous.
+            //
+            // The window can be large (readAheadBytes, up to hundreds of MiB) while
+            // the link may only deliver single-digit Mbps, so "wait until fully
+            // filled" means "never prefetch anything beyond the playhead". That is
+            // exactly the stall we are trying to fix: the player empties its cache
+            // while the filler keeps re-attacking the same oversized window.
+            //
+            // Waiting is only useful when the hole is *inside the bytes the player
+            // is about to read next* — i.e. a short leading gap. Once we have made
+            // progress, fall through to sequential tip fill, which is what actually
+            // builds a runway ahead of the playhead.
+            val madeProgress = store.contiguousFrom(pStart) + pStart > holeStart
+            if (!filled && !madeProgress) {
+              // Nothing at all came back: back off briefly so we do not hot-spin on
+              // a dead origin, then retry from the top of the loop.
               runCatching { Thread.sleep(20) }
               continue
             }
-            log("priority window filled $pStart-$pEnd")
           }
         }
 
@@ -1054,10 +1067,14 @@ class SegmentedHttpCache(
             continue
           }
         }
+        // Priority window was handled above. Only yield to it here if the playhead
+        // itself still has an *unread* leading gap; a merely "sparse but progressing"
+        // window must not starve sequential tip fill or we never build a runway.
         val livePriority = activePriorityWindow()
         if (livePriority != null) {
-          val (ps2, pe2) = livePriority
-          if (ps2 + store.contiguousFrom(ps2) < pe2) continue
+          val (ps2, _) = livePriority
+          val leadHave = store.contiguousFrom(ps2)
+          if (leadHave <= 0L) continue
         }
 
         val jobs = ArrayList<Future<*>>(stripe)

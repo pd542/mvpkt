@@ -392,7 +392,9 @@ class PlayerActivity : AppCompatActivity() {
         "SEG",
         "opened multi-conn playPath=${PlaybackSessionLog.redactUrl(result.playPath)} " +
           "src=${PlaybackSessionLog.redactUrl(uri)} connections=$connections chunkKb=$chunkKb " +
-          "transcode=$allowTranscode proxy=${systemProxy?.mpvHttpProxyUrl ?: "none"} proxyCap=$proxyCap",
+          "transcodePref=$allowTranscode proxy=${systemProxy?.mpvHttpProxyUrl ?: "none"} " +
+          "proxyCap=${if (systemProxy != null) proxyCap else 0} " +
+          "readAheadMb=${networkPreferences.readAheadMb.get()}",
       )
       result.playPath
     } else {
@@ -400,7 +402,7 @@ class PlayerActivity : AppCompatActivity() {
       PlaybackSessionLog.i(
         "SEG",
         "fallback direct (not segmented) src=${PlaybackSessionLog.redactUrl(uri)} " +
-          "transcode=$allowTranscode",
+          "transcodePref=$allowTranscode",
       )
       uri
     }
