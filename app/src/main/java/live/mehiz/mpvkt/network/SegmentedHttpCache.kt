@@ -334,6 +334,15 @@ class SegmentedHttpCache(
     private const val PRIORITY_SEEK_DELTA = 512L * 1024L
 
     /**
+     * How far the playhead must be ahead of the sequential fill cursor before the
+     * filler abandons its current position and re-anchors to the playhead.
+     *
+     * A whole chunk worth: below this the cursor will reach the playhead on its own
+     * almost immediately, so jumping just adds churn.
+     */
+    private const val FILL_ANCHOR_TOLERANCE = 4L * 1024L * 1024L
+
+    /**
      * How far past the produced watermark (see [Session.producedWatermark]) the
      * transcode scheduler may plan.
      *
@@ -879,12 +888,60 @@ class SegmentedHttpCache(
       priorityEnd.set(
         if (isNewSeek) e else maxOf(e, prevEnd),
       )
+      // Non-expiring memory of the playhead, for [fillAnchor]. Only moves forward
+      // on sequential reads; a real seek may legitimately move it backwards.
+      if (isNewSeek) {
+        lastPlayheadOffset.set(s)
+      } else {
+        lastPlayheadOffset.set(maxOf(lastPlayheadOffset.get(), s))
+      }
       if (isNewSeek) {
         priorityGen.incrementAndGet()
         log("playhead priority SEEK $s-$e")
       }
       priorityDeadlineMs.set(System.currentTimeMillis() + PRIORITY_TTL_MS)
     }
+
+    /**
+     * Where the sequential filler should actually be filling, given [current].
+     *
+     * Normally this is just [current] (plain sequential tip fill). But when the
+     * playhead is somewhere this loop has not reached yet, the playhead is what
+     * matters and the cursor is dragged forward to it.
+     *
+     * Uses [lastPlayheadOffset] rather than only [activePriorityWindow] because the
+     * window expires after [PRIORITY_TTL_MS] of no reads -- and the playhead goes
+     * quiet precisely when it is starved, i.e. exactly when re-anchoring matters
+     * most. Without this, a seek to the middle of a 27 GiB file leaves the filler
+     * marching up from byte 0, tens of GiB behind, while the player rebuffers.
+     *
+     * Only ever moves *forward*: re-anchoring backwards would reverse the cursor we
+     * already advanced and thrash on every seek. A tolerance keeps it from twitching
+     * for sub-chunk playhead wobble.
+     */
+    private fun fillAnchor(current: Long): Long {
+      val playhead = maxOf(
+        activePriorityWindow()?.first ?: -1L,
+        lastPlayheadOffset.get(),
+      )
+      if (playhead < 0L) return current
+      if (playhead <= current + FILL_ANCHOR_TOLERANCE) return current
+      // Never jump past EOF.
+      return min(playhead, config.totalSize)
+    }
+
+    /**
+     * The most recent playhead byte offset, whether or not its priority window is
+     * still refreshing.
+     *
+     * [activePriorityWindow] expires after [PRIORITY_TTL_MS] of no reads, which is
+     * correct for *prioritising* work — but it is exactly the wrong signal for the
+     * sequential filler, because the playhead stops issuing reads precisely when it
+     * has been starved. Falling back to "start from the file head" in that moment is
+     * how a seek to the middle of a 27 GiB file ends up racing a filler that is 13 GiB
+     * behind. So keep a separate, non-expiring record of where the player last was.
+     */
+    private val lastPlayheadOffset = AtomicLong(-1L)
 
     private fun activePriorityWindow(): Pair<Long, Long>? {
       val s = priorityStart.get()
@@ -1048,6 +1105,26 @@ class SegmentedHttpCache(
               continue
             }
           }
+        }
+
+        // 1b) Re-anchor the sequential fill to the playhead.
+        //
+        // The player seeks: on a 27 GiB file it can jump to a byte offset that is
+        // *tens of GiB* past where this loop started. Filling sequentially from the
+        // original `from` (the file head) then walks toward the playhead at link
+        // speed -- minutes or hours behind, during which the playhead has literally
+        // zero buffered bytes and rebuffers continuously.
+        //
+        // So: whenever a live priority window points at a region this loop is still
+        // far behind, move the sequential cursor to the playhead's own offset. The
+        // bytes before it are not worthless (they are the file), but they are
+        // useless *now*, and "now" is the only thing that decides whether playback
+        // stalls. The head/tail ranges mpv needs for demux are already fetched
+        // eagerly at open time.
+        val anchor = fillAnchor(pos)
+        if (anchor != pos) {
+          log("stripe fill re-anchored $pos -> $anchor (playhead moved)")
+          pos = anchor
         }
 
         // 2) Sequential tip fill (after priority is satisfied or expired).
