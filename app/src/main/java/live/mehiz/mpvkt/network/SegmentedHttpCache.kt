@@ -983,9 +983,22 @@ class SegmentedHttpCache(
           log("ensureRange waiting for transcode watermark hole=$holeStart ceil=$ceiling")
           return false
         }
+        // Size the parallel fill window from the *configured* connection count.
+        //
+        // This used to be `connections.coerceAtMost(6)`. On a 16-connection setup
+        // that silently capped the window at 6 chunks (~8.8 MiB with a 1.5 MiB
+        // chunk), so even though 16 connections were open only 6 slices were ever
+        // in flight and the bytes the playhead needed stayed sparse. A sparse
+        // window is useless to the player: `contiguousFrom(pos)` stays tiny and mpv
+        // reports demuxCacheSec ~= 0 and rebuffers every few seconds.
+        //
+        // Keep a sane upper bound (12, matching fillWindowParallel / the stripe
+        // filler) so one ensureRange call cannot flood the origin, but honour the
+        // real connection count below that.
+        val windowChunks = config.connections.coerceIn(2, 12)
         val windowEnd = min(
           min(end, ceiling),
-          holeStart + config.chunkBytes.toLong() * config.connections.coerceAtMost(6),
+          holeStart + config.chunkBytes.toLong() * windowChunks,
         )
         val filled = fillWindowParallel(holeStart, windowEnd, deadline)
         val nowHave = store.contiguousFrom(start)
@@ -997,6 +1010,16 @@ class SegmentedHttpCache(
           if (!filled || spins >= 2) {
             runCatching { Thread.sleep(40L * spins.coerceAtMost(6)) }
           }
+        }
+        // Diagnostic for the "playhead starved while downloads run" case: shows the
+        // exact contiguous runway at the playhead and how wide the parallel window
+        // actually is. Without this, a stalled playhead is indistinguishable from a
+        // slow link in the log.
+        if (spins in 1..2 && nowHave < end - start) {
+          log(
+            "ensureRange spin=$spins start=$start end=$end have=$nowHave " +
+              "hole=$holeStart windowEnd=$windowEnd chunks=$windowChunks filled=$filled",
+          )
         }
         if (start + nowHave >= end) return true
       }
@@ -1062,7 +1085,10 @@ class SegmentedHttpCache(
       if (afterOffset >= config.totalSize) return
       // Stripe filler: sequential tip fill, but always yields to seek priority.
       serverExecutor.execute { stripeFillLoop(afterOffset) }
-      log("background stripe filler from $afterOffset workers=${config.connections}")
+      log(
+        "background stripe filler from $afterOffset workers=${config.connections} " +
+          "chunkKb=${config.chunkBytes / 1024} readAheadMb=${config.readAheadBytes / (1024 * 1024)}",
+      )
     }
 
     /**
@@ -1075,6 +1101,34 @@ class SegmentedHttpCache(
       val stripe = config.connections.coerceIn(2, 12)
       val chunk = config.chunkBytes.toLong()
       while (running.get() && pos < config.totalSize) {
+        // 0) Re-anchor the sequential fill to the playhead FIRST.
+        //
+        // This must run *before* the priority-window block below. That block can
+        // `continue` the loop (when a fill attempt makes no progress), so any
+        // anchor logic placed after it is unreachable in exactly the situation it
+        // exists for: a seek far ahead of the sequential cursor. In the field this
+        // showed up as the re-anchor log line never firing at all while the player
+        // rebuffered -- the cursor kept marching up from the file head, tens of GiB
+        // behind the playhead.
+        //
+        // The player seeks: on a 27 GiB file it can jump to a byte offset that is
+        // *tens of GiB* past where this loop started. Filling sequentially from the
+        // original `from` (the file head) then walks toward the playhead at link
+        // speed -- minutes or hours behind, during which the playhead has literally
+        // zero buffered bytes and rebuffers continuously.
+        //
+        // So: whenever a live priority window points at a region this loop is still
+        // far behind, move the sequential cursor to the playhead's own offset. The
+        // bytes before it are not worthless (they are the file), but they are
+        // useless *now*, and "now" is the only thing that decides whether playback
+        // stalls. The head/tail ranges mpv needs for demux are already fetched
+        // eagerly at open time.
+        val anchor = fillAnchor(pos)
+        if (anchor != pos) {
+          log("stripe fill re-anchored $pos -> $anchor (playhead moved)")
+          pos = anchor
+        }
+
         // 1) Serve seek/playhead holes first (if still active).
         // Sparse multi-conn can leave holes at the playhead while total downloaded is large;
         // always drain the live window before sequential tip fill.
@@ -1105,26 +1159,6 @@ class SegmentedHttpCache(
               continue
             }
           }
-        }
-
-        // 1b) Re-anchor the sequential fill to the playhead.
-        //
-        // The player seeks: on a 27 GiB file it can jump to a byte offset that is
-        // *tens of GiB* past where this loop started. Filling sequentially from the
-        // original `from` (the file head) then walks toward the playhead at link
-        // speed -- minutes or hours behind, during which the playhead has literally
-        // zero buffered bytes and rebuffers continuously.
-        //
-        // So: whenever a live priority window points at a region this loop is still
-        // far behind, move the sequential cursor to the playhead's own offset. The
-        // bytes before it are not worthless (they are the file), but they are
-        // useless *now*, and "now" is the only thing that decides whether playback
-        // stalls. The head/tail ranges mpv needs for demux are already fetched
-        // eagerly at open time.
-        val anchor = fillAnchor(pos)
-        if (anchor != pos) {
-          log("stripe fill re-anchored $pos -> $anchor (playhead moved)")
-          pos = anchor
         }
 
         // 2) Sequential tip fill (after priority is satisfied or expired).
