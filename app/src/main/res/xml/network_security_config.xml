@@ -1,7 +1,29 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Allow cleartext to localhost for the multi-connection media proxy (libmpv + app). -->
+<!--
+  Cleartext policy.
+
+  `android:usesCleartextTraffic` in AndroidManifest is IGNORED once a
+  networkSecurityConfig is present, so this file is the single source of truth.
+
+  Why the base config permits cleartext:
+
+  - Multi-connection acceleration and libmpv both talk to the origin server
+    directly. Many self-hosted media servers (Emby/Jellyfin on a LAN) are plain
+    HTTP, e.g. http://192.168.1.10:8096. With `cleartextTrafficPermitted="false"`
+    every probe failed with
+      IOException: Cleartext HTTP traffic to <host> not permitted
+    so the probe reported len=-1 / range=false and playback silently fell back to
+    a single mpv connection — the accelerator never ran.
+  - libmpv's own player is a native library and does not go through Android's
+    network security config; only the app's Java/Kotlin HTTP stack (segmented
+    downloader, OpenList resolver, probes) was blocked. That asymmetry made the
+    failure hard to see from the UI: playback worked, just slow.
+
+  The localhost entries stay explicit so the on-device media proxy keeps working
+  even if the base policy is ever tightened again.
+-->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="false" />
+    <base-config cleartextTrafficPermitted="true" />
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="true">127.0.0.1</domain>
         <domain includeSubdomains="true">localhost</domain>

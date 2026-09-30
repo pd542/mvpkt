@@ -102,6 +102,12 @@ class SegmentedHttpCache(
     val contentLength: Long,
     val contentType: String?,
     val finalUrl: String,
+    /**
+     * Transport-level failure that prevented the probe from being answered, if any
+     * (e.g. `Cleartext HTTP traffic to <host> not permitted`). Used to explain why
+     * multi-connection acceleration was skipped instead of degrading silently.
+     */
+    val lastError: String? = null,
   )
 
   data class CacheSnapshot(
@@ -152,6 +158,25 @@ class SegmentedHttpCache(
           "type=${probe.contentType} transcode=$transcode " +
           "url=${PlaybackSessionLog.redactUrl(mediaUrl)}",
       )
+      // The most common reason the probe fails on an otherwise reachable server is
+      // Android blocking cleartext HTTP for this app (network_security_config).
+      // Say so loudly: otherwise this degrades to single-connection playback
+      // silently, and neither the byte budget nor the connection count can help.
+      probe.lastError?.let { err ->
+        val cleartext = err.contains("Cleartext", ignoreCase = true)
+        PlaybackSessionLog.w(
+          "SEG",
+          if (cleartext) {
+            "MULTI-CONN DISABLED: cleartext HTTP blocked by the app's network " +
+              "security policy. This URL is http:// and the probe was refused, so " +
+              "multi-connection acceleration will NOT run (playback falls back to a " +
+              "single connection). Fix: permit cleartext for this host in " +
+              "res/xml/network_security_config.xml. err=$err"
+          } else {
+            "probe failed, multi-conn disabled err=$err"
+          },
+        )
+      }
       return OpenResult(mediaUrl, false)
     }
 
@@ -480,9 +505,10 @@ class SegmentedHttpCache(
       val get = probeOnce(url, userAgent, requestHeaders, useHead = false, systemProxy = systemProxy)
       if (isHtmlType(get.contentType) || get.contentLength in 1 until 8 * 1024) {
         // HTML error page or tiny payload — not a progressive video.
-        return ProbeResult(false, get.contentLength, get.contentType, get.finalUrl)
+        return ProbeResult(false, get.contentLength, get.contentType, get.finalUrl, get.lastError)
       }
-      return get
+      // Surface whichever attempt actually failed so the caller can explain the skip.
+      return get.copy(lastError = get.lastError ?: head.lastError)
     }
 
     private fun isHtmlType(type: String?): Boolean {
@@ -541,13 +567,13 @@ class SegmentedHttpCache(
           }
         }
       } catch (e: Exception) {
+        val msg = "${e.javaClass.simpleName}:${e.message}"
         PlaybackSessionLog.w(
           "SEG",
-          "probe $method error=${e.javaClass.simpleName}:${e.message} " +
-            "url=${PlaybackSessionLog.redactUrl(url)}",
+          "probe $method error=$msg url=${PlaybackSessionLog.redactUrl(url)}",
         )
         runCatching { conn.disconnect() }
-        ProbeResult(false, -1L, null, url)
+        ProbeResult(false, -1L, null, url, lastError = msg)
       }
     }
 
