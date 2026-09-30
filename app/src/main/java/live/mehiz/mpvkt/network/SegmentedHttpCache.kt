@@ -1078,8 +1078,7 @@ class SegmentedHttpCache(
       if (store.isFullyCovered(from, end)) return true
       val chunk = config.chunkBytes.toLong()
       val workers = config.connections.coerceIn(2, 12)
-      var pos = from
-      var scheduled = 0
+      val cursor = WindowCursor(from)
       val genAtStart = priorityGen.get()
       // In-flight slices, kept short (a handful of entries) so the poll below stays cheap.
       val inflight = ArrayList<CompletableFuture<Boolean>>(workers)
@@ -1097,22 +1096,9 @@ class SegmentedHttpCache(
 
       while (true) {
         if (System.currentTimeMillis() >= deadline) break
-        if (!stillWanted(pos)) break
+        if (!stillWanted(cursor.pos)) break
         // Top up every free slot rather than refilling only after the whole batch ends.
-        while (inflight.size < workers && pos < end) {
-          if (!stillWanted(pos)) break
-          val already = store.contiguousFrom(pos)
-          if (already > 0) {
-            pos += already
-            continue
-          }
-          val rangeEnd = min(end, pos + chunk) - 1
-          if (rangeEnd < pos) break
-          val start = pos
-          pos = rangeEnd + 1
-          scheduled++
-          inflight += scheduleRangeDownload(start, rangeEnd)
-        }
+        topUp(inflight, workers, end, chunk, cursor, ::stillWanted)
         if (inflight.isEmpty()) break
         // Wait for *any* completion (not all), then reclaim finished slots.
         // Never cancel in-flight Range GETs — cancelling them was the main reason
@@ -1125,7 +1111,7 @@ class SegmentedHttpCache(
         inflight.removeAll { it.isDone }
       }
 
-      if (scheduled == 0) {
+      if (cursor.scheduled == 0) {
         return store.contiguousFrom(from) > 0 || store.isFullyCovered(from, end)
       }
       // Let already-running slices finish rather than abandoning them; they are
@@ -1135,6 +1121,42 @@ class SegmentedHttpCache(
         runCatching { f.get(drainMs, TimeUnit.MILLISECONDS) }
       }
       return store.contiguousFrom(from) > 0 || store.isFullyCovered(from, end)
+    }
+
+    /** Mutable scheduling cursor shared by the window loops. */
+    private class WindowCursor(var pos: Long) {
+      var scheduled = 0
+    }
+
+    /**
+     * Start slices until [inflight] holds [workers] entries or [end] is reached.
+     *
+     * Kept separate from [fillWindowParallel] so both the priority window and the
+     * stripe filler can drive the same pipelined scheduling without duplicating the
+     * contiguous-skip and seek-guard logic.
+     */
+    private fun topUp(
+      inflight: MutableList<CompletableFuture<Boolean>>,
+      workers: Int,
+      end: Long,
+      chunk: Long,
+      cursor: WindowCursor,
+      stillWanted: (Long) -> Boolean,
+    ) {
+      while (inflight.size < workers && cursor.pos < end) {
+        if (!stillWanted(cursor.pos)) break
+        val already = store.contiguousFrom(cursor.pos)
+        if (already > 0) {
+          cursor.pos += already
+          continue
+        }
+        val rangeEnd = min(end, cursor.pos + chunk) - 1
+        if (rangeEnd < cursor.pos) break
+        val start = cursor.pos
+        cursor.pos = rangeEnd + 1
+        cursor.scheduled++
+        inflight += scheduleRangeDownload(start, rangeEnd)
+      }
     }
 
     fun startBackground(afterOffset: Long) {
@@ -1392,36 +1414,18 @@ class SegmentedHttpCache(
         when {
           code != HttpURLConnection.HTTP_PARTIAL && code != HttpURLConnection.HTTP_OK ->
             "HTTP $code for $start-$end"
-          code == HttpURLConnection.HTTP_OK && start != 0L -> {
-            // Server ignored our Range and is re-sending from byte 0. For a
-            // transcode session this means "bytes at $start are not produced yet".
-            // Never write a body that starts at 0 into offset $start — that would
-            // corrupt the cache. Report it so the scheduler backs off the window.
-            if (config.transcodeMode) transcodeRangeDenied.set(true)
-            "Range ignored at $start (HTTP 200)"
-          }
-          else -> {
-            val wrote = writeStreamToFile(conn.inputStream, start, end) { reusable = true }
-            if (wrote > 0 || store.isFullyCovered(start, end + 1)) {
-              // Contiguous tip progress proves the server produced up to here, so
-              // the watermark may advance. (Only ever moves forward.)
-              if (config.transcodeMode) {
-                advanceWatermarkTo(start + wrote + store.contiguousFrom(start + wrote))
-              }
-              null
-            } else {
-              "no bytes written for $start-$end"
-            }
-          }
+          code == HttpURLConnection.HTTP_OK && start != 0L ->
+            handleRangeIgnored(start)
+          else -> consumeRangeBody(conn, start, end) { reusable = true }
         }
       } catch (e: Exception) {
         e.message ?: e.javaClass.simpleName
       } finally {
         // Keep the socket alive on the happy path so the JVM's KeepAliveCache can
         // hand it to the next Range GET. Calling disconnect() unconditionally made
-        // the "Connection: keep-alive" header above a no-op: every slice paid a
-        // fresh TCP + proxy handshake, which on a 60-150 ms RTT tunnel is 20-35% of
-        // the slice's wall time spent transferring nothing. That is the mechanical
+        // the "Connection: keep-alive" header a no-op: every slice paid a fresh
+        // TCP + proxy handshake, which on a 60-150 ms RTT tunnel is 20-35% of the
+        // slice's wall time spent transferring nothing. That is the mechanical
         // cause of throughput oscillating between "fine" and "stalled".
         //
         // Tear the connection down whenever the exchange did not finish cleanly:
@@ -1431,6 +1435,42 @@ class SegmentedHttpCache(
           runCatching { conn?.disconnect() }
         }
       }
+    }
+
+    /**
+     * Stream the accepted response body into the cache and report whether the
+     * watermark may advance. Returns null on success, else a diagnostic message.
+     *
+     * @param onBodyConsumed signals that the socket may be pooled (see
+     *   [writeStreamToFile]).
+     */
+    private fun consumeRangeBody(
+      conn: HttpURLConnection,
+      start: Long,
+      end: Long,
+      onBodyConsumed: () -> Unit,
+    ): String? {
+      val wrote = writeStreamToFile(conn.inputStream, start, end, onBodyConsumed)
+      if (wrote <= 0 && !store.isFullyCovered(start, end + 1)) {
+        return "no bytes written for $start-$end"
+      }
+      // Contiguous tip progress proves the server produced up to here, so the
+      // watermark may advance. (Only ever moves forward.)
+      if (config.transcodeMode) {
+        advanceWatermarkTo(start + wrote + store.contiguousFrom(start + wrote))
+      }
+      return null
+    }
+
+    /**
+     * The server ignored our Range and is re-sending from byte 0. For a transcode
+     * session this means "bytes at [start] are not produced yet". Never write a body
+     * that starts at 0 into offset [start] — that would corrupt the cache — so just
+     * report it and let the scheduler back off the window.
+     */
+    private fun handleRangeIgnored(start: Long): String {
+      if (config.transcodeMode) transcodeRangeDenied.set(true)
+      return "Range ignored at $start (HTTP 200)"
     }
 
     /**
