@@ -158,6 +158,11 @@
     <string name="pref_network_multi_connection_summary">Downloads the video head first, then fills the rest with parallel HTTP Range requests (like a browser/IDM). Works for progressive mp4/mkv when the server supports Range. Auto-falls back to direct play if not. Not for HLS/m3u8.</string>
     <string name="pref_network_multi_connection_count">Parallel connections</string>
     <string name="pref_network_multi_connection_chunk">Chunk size</string>
+    <string name="pref_network_multi_conn_transcode">Multi-conn for transcoded streams</string>
+    <string name="pref_network_multi_conn_transcode_summary">Also use parallel Range requests for Emby/Jellyfin transcoded streams. A transcoder produces the stream sequentially, so this app uses a watermark window (connections only fetch bytes the server has already produced). Useful only when the server transcodes faster than your network link; otherwise throughput stays limited by the transcoder. Off by default.</string>
+    <string name="pref_network_proxy_connection_cap">Limit connections behind proxy</string>
+    <string name="pref_network_proxy_connection_cap_summary">Cap parallel Range connections when a system HTTP proxy is active (e.g. NekoBox). Proxy nodes often rate-limit concurrent streams, so 8–16 sockets can be slower than 4. Global VPN/TUN is unaffected (it is not a system HTTP proxy).</string>
+    <string name="pref_network_proxy_connection_cap_count">Connections behind proxy</string>
     <string name="pref_network_prefer_highest_bandwidth">Prefer highest HLS bitrate</string>
     <string name="pref_network_prefer_highest_bandwidth_summary">Pick the top quality rung when the stream is adaptive (HLS). Uses more bandwidth.</string>
     <string name="pref_network_demuxer_seekable_cache">Seekable demuxer cache</string>

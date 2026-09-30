@@ -350,6 +350,46 @@ object NetworkPreferencesScreen : Screen {
             summary = { Text(stringResource(R.string.pref_network_demuxer_seekable_cache_summary)) },
           )
 
+          val multiConnTranscode by preferences.multiConnTranscode.collectAsState()
+          SwitchPreference(
+            value = multiConnTranscode,
+            onValueChange = preferences.multiConnTranscode::set,
+            title = { Text(stringResource(R.string.pref_network_multi_conn_transcode)) },
+            summary = { Text(stringResource(R.string.pref_network_multi_conn_transcode_summary)) },
+          )
+
+          val useSystemHttpProxy by preferences.useSystemHttpProxy.collectAsState()
+          SwitchPreference(
+            value = preferHighestBandwidth,
+            onValueChange = preferences.preferHighestBandwidth::set,
+            title = { Text(stringResource(R.string.pref_network_prefer_highest_bandwidth)) },
+            summary = { Text(stringResource(R.string.pref_network_prefer_highest_bandwidth_summary)) },
+          )
+
+          val preferHighestBandwidth by preferences.preferHighestBandwidth.collectAsState()
+          SwitchPreference(
+            value = preferHighestBandwidth,
+            onValueChange = preferences.preferHighestBandwidth::set,
+            title = { Text(stringResource(R.string.pref_network_prefer_highest_bandwidth)) },
+            summary = { Text(stringResource(R.string.pref_network_prefer_highest_bandwidth_summary)) },
+          )
+
+          val demuxerSeekableCache by preferences.demuxerSeekableCache.collectAsState()
+          SwitchPreference(
+            value = demuxerSeekableCache,
+            onValueChange = preferences.demuxerSeekableCache::set,
+            title = { Text(stringResource(R.string.pref_network_demuxer_seekable_cache)) },
+            summary = { Text(stringResource(R.string.pref_network_demuxer_seekable_cache_summary)) },
+          )
+
+          val multiConnTranscode by preferences.multiConnTranscode.collectAsState()
+          SwitchPreference(
+            value = multiConnTranscode,
+            onValueChange = preferences.multiConnTranscode::set,
+            title = { Text(stringResource(R.string.pref_network_multi_conn_transcode)) },
+            summary = { Text(stringResource(R.string.pref_network_multi_conn_transcode_summary)) },
+          )
+
           val useSystemHttpProxy by preferences.useSystemHttpProxy.collectAsState()
           SwitchPreference(
             value = useSystemHttpProxy,
@@ -366,6 +406,32 @@ object NetworkPreferencesScreen : Screen {
             summary = {
               Text(stringResource(R.string.pref_network_disable_multi_conn_under_proxy_summary))
             },
+          )
+
+          val proxyConnectionCap by preferences.proxyConnectionCap.collectAsState()
+          SwitchPreference(
+            value = proxyConnectionCap,
+            onValueChange = preferences.proxyConnectionCap::set,
+            title = { Text(stringResource(R.string.pref_network_proxy_connection_cap)) },
+            summary = { Text(stringResource(R.string.pref_network_proxy_connection_cap_summary)) },
+          )
+
+          val proxyConnectionCapCount by preferences.proxyConnectionCapCount.collectAsState()
+          val proxyConnectionCapCountFloat = proxyConnectionCapCount.toFloat()
+          SliderPreference(
+            value = proxyConnectionCapCountFloat,
+            onValueChange = { value ->
+              preferences.proxyConnectionCapCount.set(value.roundToInt().coerceIn(2, 8))
+            },
+            title = { Text(stringResource(R.string.pref_network_proxy_connection_cap_count)) },
+            valueRange = 2f..8f,
+            summary = {
+              Text(stringResource(R.string.pref_network_value_threads, proxyConnectionCapCount))
+            },
+            onSliderValueChange = { value ->
+              preferences.proxyConnectionCapCount.set(value.roundToInt().coerceIn(2, 8))
+            },
+            sliderValue = proxyConnectionCapCountFloat,
           )
 
           val tlsVerify by preferences.tlsVerify.collectAsState()

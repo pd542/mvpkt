@@ -263,7 +263,9 @@ class PlayerActivity : AppCompatActivity() {
    */
   private fun shouldUseSegmentedDownload(source: String): Boolean {
     val multiEnabled = networkPreferences.multiConnectionDownload.get()
-    val acceleratable = SegmentedHttpCache.shouldTryAccelerate(source)
+    // Transcoded streams use the watermark-window scheduler; opt-in separately.
+    val allowTranscode = networkPreferences.multiConnTranscode.get()
+    val acceleratable = SegmentedHttpCache.shouldTryAccelerate(source, allowTranscode)
     val proxy = resolveSystemHttpProxy()
     val blockedByProxy = proxy != null && networkPreferences.disableMultiConnUnderProxy.get()
     proxy?.takeIf { blockedByProxy }?.let {
@@ -313,8 +315,10 @@ class PlayerActivity : AppCompatActivity() {
     )
     // Local multi-conn proxy / remote HTTP: always use loadfile so headers stick.
     if (useLoadfileCommand || isLocalProxy || isRemoteHttp) {
-      if (isLocalProxy) {
-        // Help lavf treat progressive proxy as seekable http.
+      if (isLocalProxy && networkPreferences.optimizeForNetwork.get()) {
+        // help lavf treat the progressive proxy as seekable http;
+        // gated behind optimizeForNetwork instead of being forced unconditionally,
+        // which previously overrode the user's streaming preference.
         runCatching { MPVLib.setOptionString("force-seekable", "yes") }
       }
       MPVLib.command("loadfile", uri)
@@ -349,6 +353,12 @@ class PlayerActivity : AppCompatActivity() {
     val cacheRoot = File(cacheDir, "segmented-http").also { it.mkdirs() }
     val requestHeaders = playbackHttpHeaders(uri, intent.extras)
     val systemProxy = resolveSystemHttpProxy()
+    val allowTranscode = networkPreferences.multiConnTranscode.get()
+    val proxyCap = if (networkPreferences.proxyConnectionCap.get()) {
+      networkPreferences.proxyConnectionCapCount.get()
+    } else {
+      0
+    }
     val accelerator = SegmentedHttpCache(
       cacheDir = cacheRoot,
       connections = connections,
@@ -357,6 +367,8 @@ class PlayerActivity : AppCompatActivity() {
       requestHeaders = requestHeaders,
       systemProxy = systemProxy,
       limitConnectionsUnderProxy = true,
+      allowTranscode = allowTranscode,
+      proxyConnCap = proxyCap,
     )
     val result = accelerator.open(uri)
     return if (result.usedSegmented) {
@@ -366,14 +378,15 @@ class PlayerActivity : AppCompatActivity() {
         "SEG",
         "opened multi-conn playPath=${PlaybackSessionLog.redactUrl(result.playPath)} " +
           "src=${PlaybackSessionLog.redactUrl(uri)} connections=$connections chunkKb=$chunkKb " +
-          "proxy=${systemProxy?.mpvHttpProxyUrl ?: "none"}",
+          "transcode=$allowTranscode proxy=${systemProxy?.mpvHttpProxyUrl ?: "none"} proxyCap=$proxyCap",
       )
       result.playPath
     } else {
       accelerator.deleteCache()
       PlaybackSessionLog.i(
         "SEG",
-        "fallback direct (not segmented) src=${PlaybackSessionLog.redactUrl(uri)}",
+        "fallback direct (not segmented) src=${PlaybackSessionLog.redactUrl(uri)} " +
+          "transcode=$allowTranscode",
       )
       uri
     }
@@ -517,6 +530,12 @@ class PlayerActivity : AppCompatActivity() {
     val chunkKb = networkPreferences.multiConnectionChunkKb.get().coerceIn(256, 4096)
     val cacheRoot = File(cacheDir, "segmented-http").also { it.mkdirs() }
     val requestHeaders = playbackHttpHeaders(source, intent.extras)
+    val allowTranscode = networkPreferences.multiConnTranscode.get()
+    val proxyCap = if (networkPreferences.proxyConnectionCap.get()) {
+      networkPreferences.proxyConnectionCapCount.get()
+    } else {
+      0
+    }
     val accelerator = SegmentedHttpCache(
       cacheDir = cacheRoot,
       connections = connections,
@@ -525,6 +544,8 @@ class PlayerActivity : AppCompatActivity() {
       requestHeaders = requestHeaders,
       systemProxy = resolveSystemHttpProxy(),
       limitConnectionsUnderProxy = true,
+      allowTranscode = allowTranscode,
+      proxyConnCap = proxyCap,
     )
     val result = accelerator.open(source)
     return if (result.usedSegmented) {

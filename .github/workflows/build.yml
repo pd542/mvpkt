@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - master
+      - "perf/**"
     tags-ignore:
       - "v*"
 

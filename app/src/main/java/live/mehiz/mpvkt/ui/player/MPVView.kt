@@ -59,8 +59,11 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
   var aid: Int by TrackDelegate("aid")
 
   override fun initOptions() {
-    setVo(if (decoderPreferences.gpuNext.get()) "gpu-next" else "gpu")
+    // `profile=fast` MUST be set before the vo/hwdec/HDR options below.
+    // It is an option *profile* that overwrites a range of vo/gpu defaults;
+    // setting it afterwards silently reverted `gpu-next` and HDR tone-mapping.
     MPVLib.setOptionString("profile", "fast")
+    setVo(if (decoderPreferences.gpuNext.get()) "gpu-next" else "gpu")
     MPVLib.setOptionString("hwdec", if (decoderPreferences.tryHWDecoding.get()) "auto" else "no")
 
     if (decoderPreferences.useYUV420P.get()) {
@@ -190,12 +193,13 @@ class MPVView(context: Context, attributes: AttributeSet) : BaseMPVView(context,
 
   private fun applyDemuxerCacheOptions() {
     val forwardCacheBytes =
-      networkPreferences.demuxerMaxCacheMb.get().coerceIn(8, 512) * 1024L * 1024L
+      networkPreferences.demuxerMaxCacheMb.get().coerceIn(8, 1024) * 1024L * 1024L
     val backCacheBytes =
-      networkPreferences.demuxerMaxBackCacheMb.get().coerceIn(8, 512) * 1024L * 1024L
+      networkPreferences.demuxerMaxBackCacheMb.get().coerceIn(8, 1024) * 1024L * 1024L
     MPVLib.setOptionString("demuxer-max-bytes", forwardCacheBytes.toString())
     MPVLib.setOptionString("demuxer-max-back-bytes", backCacheBytes.toString())
 
+    // Only meaningful with cache=no; kept for users who disable the cache below.
     val readahead = networkPreferences.demuxerReadaheadSecs.get().coerceIn(0, 120)
     if (readahead > 0) {
       MPVLib.setOptionString("demuxer-readahead-secs", readahead.toString())

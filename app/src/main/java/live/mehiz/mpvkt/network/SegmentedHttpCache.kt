@@ -47,6 +47,19 @@ import kotlin.math.min
  * 4. Background workers extend the contiguous tip with short parallel stripes (not scatter-fill)
  *
  * Never hand a sparse file path to mpv — unwritten regions read as zeros and break demux.
+ *
+ * ## Two scheduling modes
+ *
+ * - **Static file** (CDN / direct): chunks are addressable at random. Workers may
+ *   stripe ahead freely; every offset returns real bytes immediately.
+ * - **Live transcode** (`config.transcodeMode`, Emby/Jellyfin `/Videos/.../stream`):
+ *   the server *produces* the byte stream sequentially. A request for a chunk that
+ *   has not been produced yet either blocks until it is (burning a connection and
+ *   making multi-conn slower than single-stream) or is answered `200 OK` from byte 0
+ *   (which would corrupt the cache). Here the scheduler clamps every request to
+ *   `[producedWatermark, producedWatermark + TRANSCODE_LOOKAHEAD_BYTES)`, so all N
+ *   connections pipeline over already-produced bytes. Throughput remains bounded by
+ *   the server's transcode rate, not by bandwidth.
  */
 class SegmentedHttpCache(
   private val cacheDir: File,
@@ -64,6 +77,17 @@ class SegmentedHttpCache(
    * SOCKS/HTTP proxies that limit concurrent streams do not stall head download.
    */
   private val limitConnectionsUnderProxy: Boolean = true,
+  /**
+   * Allow multi-connection download for **transcoded** media-server streams.
+   *
+   * Transcode output is produced sequentially, so byte ranges far past the
+   * transcoder's watermark do not exist yet. In this mode the scheduler switches
+   * to a *watermark window*: only chunks near the produced prefix are requested
+   * (with bounded look-ahead), so N connections pipeline instead of deadlocking.
+   */
+  private val allowTranscode: Boolean = false,
+  /** Hard cap applied when a real system HTTP proxy is in use (0 = no extra cap). */
+  private val proxyConnCap: Int = 0,
 ) {
   private var session: Session? = null
 
@@ -95,11 +119,11 @@ class SegmentedHttpCache(
   fun open(originalUrl: String): OpenResult {
     return runCatching {
       val direct = resolveDirectMediaUrl(originalUrl, userAgent, requestHeaders, systemProxy)
-      if (!isAcceleratableUrl(direct)) {
+      if (!isAcceleratableUrl(direct, allowTranscode)) {
         // Prefer resolved direct URL for mpv even when not multi-conn.
         PlaybackSessionLog.i(
           "SEG",
-          "not acceleratable url=${PlaybackSessionLog.redactUrl(direct)}",
+          "not acceleratable url=${PlaybackSessionLog.redactUrl(direct)} transcode=$allowTranscode",
         )
         return@runCatching OpenResult(direct, false)
       }
@@ -116,22 +140,28 @@ class SegmentedHttpCache(
   }
 
   private fun startSession(mediaUrl: String): OpenResult {
+    // Transcode endpoints often omit Accept-Ranges on HEAD even though per-request
+    // Range works. When allowTranscode is on we accept a 200 probe as "maybe range".
     val probe = probe(mediaUrl, userAgent, requestHeaders, systemProxy)
-    if (!probe.supportsRange || probe.contentLength < MIN_FILE_FOR_ACCEL) {
+    val transcode = isMediaServerTranscodeUrl(mediaUrl.lowercase(Locale.US))
+    val rangeUsable = probe.supportsRange || (allowTranscode && probe.contentLength >= MIN_FILE_FOR_ACCEL)
+    if (!rangeUsable || probe.contentLength < MIN_FILE_FOR_ACCEL) {
       PlaybackSessionLog.i(
         "SEG",
         "probe skip range=${probe.supportsRange} len=${probe.contentLength} " +
-          "type=${probe.contentType} url=${PlaybackSessionLog.redactUrl(mediaUrl)}",
+          "type=${probe.contentType} transcode=$transcode " +
+          "url=${PlaybackSessionLog.redactUrl(mediaUrl)}",
       )
       return OpenResult(mediaUrl, false)
     }
 
     // Proxies (NekoBox HTTP/SOCKS, corporate MITM) often throttle many concurrent
-    // Range streams; keep 2–4 workers so head download still finishes.
-    val connCount = if (systemProxy != null && limitConnectionsUnderProxy) {
-      connections.coerceIn(2, 4)
-    } else {
-      connections.coerceIn(2, 16)
+    // Range streams; keep a small worker count so head download still finishes.
+    val connCount = run {
+      var n = connections.coerceIn(2, 16)
+      if (systemProxy != null && limitConnectionsUnderProxy) n = n.coerceAtMost(4)
+      if (systemProxy != null && proxyConnCap > 0) n = n.coerceAtMost(proxyConnCap.coerceIn(2, 16))
+      n.coerceAtLeast(2)
     }
     val chunk = chunkBytes.coerceIn(MIN_CHUNK, MAX_CHUNK)
     val headBytes = min(probe.contentLength, HEAD_BYTES)
@@ -149,6 +179,7 @@ class SegmentedHttpCache(
         userAgent = userAgent,
         requestHeaders = requestHeaders,
         systemProxy = systemProxy,
+        transcodeMode = transcode,
       ),
       cacheDir = cacheDir,
       log = {},
@@ -157,6 +188,7 @@ class SegmentedHttpCache(
     PlaybackSessionLog.i(
       "SEG",
       "session start len=${probe.contentLength} conn=$connCount chunk=$chunk " +
+        "transcode=$transcode rangeProbe=${probe.supportsRange} " +
         "proxy=${systemProxy?.mpvHttpProxyUrl ?: "none"} " +
         "url=${PlaybackSessionLog.redactUrl(probe.finalUrl)}",
     )
@@ -244,11 +276,28 @@ class SegmentedHttpCache(
     /** Move this far (or jump outside window) before treating as a new seek generation. */
     private const val PRIORITY_SEEK_DELTA = 512L * 1024L
 
-    fun isAcceleratableUrl(url: String): Boolean {
+    /**
+     * How far past the produced watermark (see [Session.producedWatermark]) the
+     * transcode scheduler may plan.
+     *
+     * This is the whole point of transcode multi-conn: instead of N workers each
+     * jumping to a far-away chunk (which does not exist yet → hang / HTTP 200),
+     * all N workers stay inside `[watermark, watermark + lookahead)`. Because the
+     * previous lookahead chunk has already been produced while the current one
+     * downloads, the requests hit real bytes immediately and pipeline. With 8
+     * connections the effective lookahead is `8 × chunkBytes`; 32 MiB keeps that
+     * bounded on an 8 GB device while still leaving room to pipeline.
+     */
+    private const val TRANSCODE_LOOKAHEAD_BYTES = 32L * 1024L * 1024L
+
+    fun isAcceleratableUrl(url: String, allowTranscode: Boolean = false): Boolean {
       val lower = url.lowercase(Locale.US)
       if (!lower.startsWith("http://") && !lower.startsWith("https://")) return false
-      // Adaptive streaming / transcoding endpoints — mpv handles these natively.
-      if (isAdaptiveStreamingUrl(lower) || isMediaServerTranscodeUrl(lower)) return false
+      // Adaptive streaming (HLS/DASH) — mpv handles these natively, never accelerate.
+      if (isAdaptiveStreamingUrl(lower)) return false
+      // Transcoded media-server sessions are generated sequentially; only
+      // accelerate them when the caller opted into watermark-window scheduling.
+      if (isMediaServerTranscodeUrl(lower) && !allowTranscode) return false
       // OpenList/Alist intermediate /d/?sign= links are NOT final media — resolve first.
       // Real CDN signed URLs (X-Amz-*) ARE acceleratable after resolve.
       if (isOpenListIntermediate(lower)) {
@@ -261,10 +310,12 @@ class SegmentedHttpCache(
      * Whether the multi-conn path should run at all (may only resolve OpenList then
      * fall back to direct, or start segmented on the final CDN URL).
      */
-    fun shouldTryAccelerate(url: String): Boolean {
+    fun shouldTryAccelerate(url: String, allowTranscode: Boolean = false): Boolean {
       val lower = url.lowercase(Locale.US)
       if (!lower.startsWith("http://") && !lower.startsWith("https://")) return false
-      return !isAdaptiveStreamingUrl(lower) && !isMediaServerTranscodeUrl(lower)
+      if (isAdaptiveStreamingUrl(lower)) return false
+      if (isMediaServerTranscodeUrl(lower) && !allowTranscode) return false
+      return true
     }
 
     /**
@@ -614,6 +665,12 @@ class SegmentedHttpCache(
     val userAgent: String,
     val requestHeaders: Map<String, String>,
     val systemProxy: SystemHttpProxy.Info? = null,
+    /**
+     * Media-server transcode session: output is produced sequentially, so the
+     * scheduler must never request far past the highest byte the server has
+     * actually produced. [Session.producedWatermark] tracks that boundary.
+     */
+    val transcodeMode: Boolean = false,
   )
 
   private class Session(
@@ -641,6 +698,24 @@ class SegmentedHttpCache(
     private val priorityEnd = AtomicLong(-1L)
     private val priorityGen = AtomicLong(0L)
     private val priorityDeadlineMs = AtomicLong(0L)
+
+    /**
+     * Highest byte offset (exclusive) the origin has actually produced.
+     *
+     * Only meaningful in [SessionConfig.transcodeMode]. For a live transcode the
+     * server cannot serve bytes it has not generated yet, so any Range request
+     * beyond this boundary either hangs or is silently answered with `200 OK`
+     * from byte 0. The scheduler therefore clamps its window to
+     * `watermark + TRANSCODE_LOOKAHEAD_BYTES` so N workers pipeline over already
+     * produced bytes instead of deadlocking on not-yet-existing ones.
+     *
+     * Advances only on successful contiguous progress from the *tip*, never from
+     * a seek, so a far-away seek cannot inflate it.
+     */
+    private val producedWatermark = AtomicLong(0L)
+
+    /** True once any transcode Range request was answered with 200 (bytes not ready). */
+    private val transcodeRangeDenied = AtomicBoolean(false)
     private var serverSocket: ServerSocket? = null
     val localUrl: String
 
@@ -752,8 +827,16 @@ class SegmentedHttpCache(
         val have = store.contiguousFrom(start)
         if (start + have >= end) return true
         val holeStart = start + have
+        // In transcode mode never plan past produced bytes + bounded look-ahead.
+        val ceiling = schedulerCeiling()
+        if (holeStart >= ceiling) {
+          // Nothing to fetch yet — the transcoder has not produced these bytes.
+          // Return "partial" so the caller streams what exists and waits.
+          log("ensureRange waiting for transcode watermark hole=$holeStart ceil=$ceiling")
+          return false
+        }
         val windowEnd = min(
-          end,
+          min(end, ceiling),
           holeStart + config.chunkBytes.toLong() * config.connections.coerceAtMost(6),
         )
         val filled = fillWindowParallel(holeStart, windowEnd, deadline)
@@ -783,8 +866,8 @@ class SegmentedHttpCache(
      * @return true if any progress was made or region already covered
      */
     private fun fillWindowParallel(from: Long, endExclusive: Long, deadline: Long): Boolean {
-      val end = min(endExclusive, config.totalSize)
-      if (from >= end) return true
+      val end = min(min(endExclusive, schedulerCeiling()), config.totalSize)
+      if (from >= end) return false
       if (store.isFullyCovered(from, end)) return true
       val chunk = config.chunkBytes.toLong()
       val workers = config.connections.coerceIn(2, 12)
@@ -869,6 +952,17 @@ class SegmentedHttpCache(
           pos += already
           continue
         }
+        // Transcode mode: the stripe filler must stay inside produced bytes.
+        // Requesting past the watermark would hang or return 200-from-zero and
+        // would also race the priority reader for the same scarce transcode
+        // throughput. Wait for the watermark to advance instead.
+        if (config.transcodeMode) {
+          val ceiling = schedulerCeiling()
+          if (pos >= ceiling) {
+            runCatching { Thread.sleep(120) }
+            continue
+          }
+        }
         val livePriority = activePriorityWindow()
         if (livePriority != null) {
           val (ps2, pe2) = livePriority
@@ -878,15 +972,17 @@ class SegmentedHttpCache(
         val jobs = ArrayList<Future<*>>(stripe)
         var stripePos = pos
         val genAtSchedule = priorityGen.get()
+        val stripeCeiling = schedulerCeiling()
         repeat(stripe) {
           if (stripePos >= config.totalSize) return@repeat
+          if (stripePos >= stripeCeiling) return@repeat
           val skip = store.contiguousFrom(stripePos)
           if (skip > 0) {
             stripePos += skip
             return@repeat
           }
           val start = stripePos
-          val end = min(config.totalSize, start + chunk) - 1
+          val end = min(min(config.totalSize, stripeCeiling), start + chunk) - 1
           stripePos = end + 1
           jobs += scheduleRangeDownload(start, end) {
             // Skip only if a real seek happened after schedule and this slice is
@@ -1001,11 +1097,22 @@ class SegmentedHttpCache(
         when {
           code != HttpURLConnection.HTTP_PARTIAL && code != HttpURLConnection.HTTP_OK ->
             "HTTP $code for $start-$end"
-          code == HttpURLConnection.HTTP_OK && start != 0L ->
+          code == HttpURLConnection.HTTP_OK && start != 0L -> {
+            // Server ignored our Range and is re-sending from byte 0. For a
+            // transcode session this means "bytes at $start are not produced yet".
+            // Never write a body that starts at 0 into offset $start — that would
+            // corrupt the cache. Report it so the scheduler backs off the window.
+            if (config.transcodeMode) transcodeRangeDenied.set(true)
             "Range ignored at $start (HTTP 200)"
+          }
           else -> {
             val wrote = writeStreamToFile(conn.inputStream, start, end)
             if (wrote > 0 || store.isFullyCovered(start, end + 1)) {
+              // Contiguous tip progress proves the server produced up to here, so
+              // the watermark may advance. (Only ever moves forward.)
+              if (config.transcodeMode) {
+                advanceWatermarkTo(start + wrote + store.contiguousFrom(start + wrote))
+              }
               null
             } else {
               "no bytes written for $start-$end"
@@ -1017,6 +1124,32 @@ class SegmentedHttpCache(
       } finally {
         runCatching { conn?.disconnect() }
       }
+    }
+
+    /**
+     * Raise the produced-bytes watermark to [candidate] if it is higher.
+     *
+     * Callers must only pass offsets derived from **contiguous progress starting at
+     * the current watermark**, never from an isolated seek fill — a sparse seek far
+     * ahead does not mean the transcoder skipped ahead.
+     */
+    private fun advanceWatermarkTo(candidate: Long) {
+      val clamped = candidate.coerceIn(0L, config.totalSize)
+      while (true) {
+        val cur = producedWatermark.get()
+        if (clamped <= cur) return
+        if (producedWatermark.compareAndSet(cur, clamped)) {
+          log("transcode watermark -> $clamped")
+          return
+        }
+      }
+    }
+
+    /** Upper bound (exclusive) the scheduler may request in transcode mode. */
+    private fun schedulerCeiling(): Long {
+      if (!config.transcodeMode) return config.totalSize
+      val wm = producedWatermark.get()
+      return min(config.totalSize, wm + TRANSCODE_LOOKAHEAD_BYTES)
     }
 
     /** @return number of bytes written */

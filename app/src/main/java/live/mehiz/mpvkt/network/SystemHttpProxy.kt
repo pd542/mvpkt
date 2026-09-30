@@ -67,7 +67,10 @@ object SystemHttpProxy {
       Log.d(TAG, "VPN active — skip app-layer HTTP proxy (transparent)")
       return null
     }
-    return fromConnectivityManager(context) ?: fromSystemProperties()
+    // Android never populates the JVM `http.proxyHost` properties, so the old
+    // `fromSystemProperties()` fallback was dead code. `ProxyInfo` from
+    // ConnectivityManager is the only real source.
+    return fromConnectivityManager(context)
   }
 
   fun isActive(context: Context): Boolean = current(context) != null
@@ -114,21 +117,6 @@ object SystemHttpProxy {
     } else {
       null
     }
-  }
-
-  private fun fromSystemProperties(): Info? {
-    val host = System.getProperty("http.proxyHost")?.trim().orEmpty()
-      .ifEmpty { System.getProperty("https.proxyHost")?.trim().orEmpty() }
-    val port = (
-      System.getProperty("http.proxyPort")
-        ?: System.getProperty("https.proxyPort")
-      )?.toIntOrNull()
-    val excl = System.getProperty("http.nonProxyHosts")
-      ?.split("|", ",", ";")
-      ?.map { it.trim() }
-      ?.filter { it.isNotEmpty() }
-      .orEmpty()
-    return buildInfo(host, port ?: 0, excl)
   }
 
   private fun buildInfo(host: String, port: Int, exclusionList: List<String>): Info? {
