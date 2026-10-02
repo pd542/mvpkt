@@ -1884,8 +1884,8 @@ class SegmentedHttpCache(
           // filler has run far ahead, and `.toInt()` would wrap that negative, making
           // `avail <= 0` fire on a playhead that actually has plenty of runway queued.
           val availLong = store.contiguousFrom(pos)
-          val avail = if (availLong > MAX_BODY_READ_BYTES) {
-            MAX_BODY_READ_BYTES
+          val avail: Int = if (availLong > MAX_BODY_READ_BYTES) {
+            MAX_BODY_READ_BYTES.toInt()
           } else {
             availLong.toInt()
           }
