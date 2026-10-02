@@ -336,7 +336,20 @@ class SegmentedHttpCache(
      * While background Range workers still write, use the higher cap.
      */
     private const val BODY_IDLE_ROUNDS_MAX = 300
-    private const val BODY_IDLE_ROUNDS_WHILE_DOWNLOADING = 1_200
+
+    /**
+     * How many 50 ms idle rounds the BodyReader tolerates while the wider download is
+     * still making progress. 60 s (1_200 rounds) repeatedly proved too short: the
+     * stripe filler happily streams data far ahead of the playhead for minutes, so
+     * `lastWriteAtMs` stays fresh and the reader keeps believing progress is being
+     * made even when *its* hole is not moving. Give the bypass fill and the priority
+     * window real time to win the connection back before we close the body and hand
+     * libmpv a false EOF.
+     */
+    private const val BODY_IDLE_ROUNDS_WHILE_DOWNLOADING = 6_000
+
+    /** Upper bound for a single BodyReader read; keeps Int conversions safe. */
+    private const val MAX_BODY_READ_BYTES = 1L shl 30
 
     /** Move this far (or jump outside window) before treating as a new seek generation. */
     private const val PRIORITY_SEEK_DELTA = 512L * 1024L
@@ -868,9 +881,13 @@ class SegmentedHttpCache(
       store.clear()
       raf = RandomAccessFile(cacheFile, "rw")
       raf.setLength(config.totalSize)
-      // Slightly more workers than configured connections so proxy ensureRange
-      // jobs are not starved by the sequential stripe filler.
-      val poolSize = (config.connections + 2).coerceIn(2, 18)
+      // More workers than configured connections so proxy ensureRange jobs are not
+      // starved by the sequential stripe filler. The margin used to be +2, which was
+      // not enough: `fillWindowParallel` alone dispatches up to 12 slices, so a full
+      // stripe could still consume the whole pool and leave the reader's window
+      // queued behind multi-second downloads. Size the pool for filler + reader
+      // window together.
+      val poolSize = (config.connections * 2 + 4).coerceIn(4, 32)
       executor = ThreadPoolExecutor(
         poolSize,
         poolSize,
@@ -1105,7 +1122,44 @@ class SegmentedHttpCache(
           holeStart + config.chunkBytes.toLong() * windowChunks,
         )
         val filled = fillWindowParallel(holeStart, windowEnd, deadline)
-        val nowHave = store.contiguousFrom(start)
+        var nowHave = store.contiguousFrom(start)
+        // Emergency bypass for a starved playhead.
+        //
+        // `fillWindowParallel` dispatches its slices onto the shared executor. That
+        // pool is bounded (connections+2) and is *already* saturated by the stripe
+        // filler's own workers, which stream multi-megabyte slices for tens of
+        // seconds each. So when the playhead sits on a hole the stripe filler is not
+        // covering, every `ensureRange` round can time out with `scheduled == 0`
+        // slices actually started: the reader spins on the hole while `downloaded`
+        // keeps climbing on data far ahead of the playhead. After
+        // BODY_IDLE_ROUNDS_WHILE_DOWNLOADING rounds the BodyReader closes mid-body
+        // and libmpv sees a false EOF: video freezes and the seek bar stops
+        // responding even though the link is fast.
+        //
+        // Do not add this slice to the executor: fetch it inline. This thread is
+        // already blocked waiting for the playhead bytes, so a synchronous Range GET
+        // costs nothing extra and cannot be starved by the filler. Keep it to one
+        // chunk (plus a couple of continuations) so it stays bounded.
+        if (nowHave <= 0L && System.currentTimeMillis() < deadline && running.get()) {
+          var cursor = start
+          val bypassEnd = min(end, start + config.chunkBytes.toLong() * 3L)
+          while (cursor < bypassEnd && System.currentTimeMillis() < deadline && running.get()) {
+            val already = store.contiguousFrom(cursor)
+            if (already > 0L) {
+              cursor += already
+              continue
+            }
+            val sliceEnd = min(bypassEnd, cursor + config.chunkBytes.toLong()) - 1L
+            if (sliceEnd < cursor) break
+            log("ensureRange bypass fill $cursor-$sliceEnd (executor starved)")
+            tryDownloadOnce(cursor, sliceEnd, retries = 1)
+            val gained = store.contiguousFrom(cursor)
+            if (gained <= 0L) break
+            cursor += gained
+          }
+          nowHave = store.contiguousFrom(start)
+          if (nowHave > 0L) lastHave = nowHave
+        }
         if (nowHave > lastHave) {
           lastHave = nowHave
           spins = 0
@@ -1281,9 +1335,20 @@ class SegmentedHttpCache(
      */
     private fun stripeFillLoop(from: Long) {
       var pos = from
-      val stripe = config.connections.coerceIn(2, 12)
+      val configuredStripe = config.connections.coerceIn(2, 12)
       val chunk = config.chunkBytes.toLong()
       while (running.get() && pos < config.totalSize) {
+        // Reserve headroom for the BodyReader while the playhead still owns a
+        // priority window. The stripe filler and `ensureRange` share one bounded
+        // executor; if the filler occupies every slot with far-ahead slices, the
+        // reader cannot schedule the slice covering its own hole and starves until it
+        // closes the body (false EOF: freeze + unseekable). Yielding a couple of
+        // slots costs the filler almost nothing but keeps the playhead fed.
+        val stripe = if (activePriorityWindow() != null && configuredStripe > 3) {
+          configuredStripe - 2
+        } else {
+          configuredStripe
+        }
         // 0) Re-anchor the sequential fill to the playhead FIRST.
         //
         // This must run *before* the priority-window block below. That block can
@@ -1815,10 +1880,23 @@ class SegmentedHttpCache(
           )
           setPlayheadPriority(pos, min(config.totalSize, pos + ahead))
           val ok = ensureRange(pos, needEnd, 10_000L)
-          val avail = store.contiguousFrom(pos).toInt()
-          if (avail <= 0) {
+          // Keep this a Long: contiguousFrom can legitimately report >2 GiB when the
+          // filler has run far ahead, and `.toInt()` would wrap that negative, making
+          // `avail <= 0` fire on a playhead that actually has plenty of runway queued.
+          val availLong = store.contiguousFrom(pos)
+          val avail = if (availLong > MAX_BODY_READ_BYTES) {
+            MAX_BODY_READ_BYTES
+          } else {
+            availLong.toInt()
+          }
+          if (availLong <= 0L) {
             idleRounds++
             val writing = System.currentTimeMillis() - lastWriteAtMs.get() < 20_000L
+            // Aborting mid-body is catastrophic for the player: libmpv is told the
+            // resource ended at `pos`, so it reports EOF far short of the duration and
+            // the seek bar stops responding. Only give up when the whole download has
+            // genuinely gone quiet, never merely because this one hole was slow to
+            // fill while other slices were streaming happily.
             val maxIdle = if (writing) {
               BODY_IDLE_ROUNDS_WHILE_DOWNLOADING
             } else {
