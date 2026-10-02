@@ -785,14 +785,16 @@ class SegmentedHttpCache(
      */
     private fun hasInFlightAround(offset: Long): Boolean {
       if (inFlightRanges.isEmpty()) return false
-      for (key in inFlightRanges.keys) {
-        val dash = key.indexOf('-')
-        if (dash <= 0) continue
-        val start = key.substring(0, dash).toLongOrNull() ?: continue
-        val endInclusive = key.substring(dash + 1).toLongOrNull() ?: continue
-        if (offset in start..endInclusive) return true
-      }
-      return false
+      return inFlightRanges.keys.any { key -> rangeKeyCovers(key, offset) }
+    }
+
+    /** Parse a `"$start-$endInclusive"` in-flight key and test whether it covers [offset]. */
+    private fun rangeKeyCovers(key: String, offset: Long): Boolean {
+      val dash = key.indexOf('-')
+      if (dash <= 0) return false
+      val start = key.substring(0, dash).toLongOrNull() ?: return false
+      val endInclusive = key.substring(dash + 1).toLongOrNull() ?: return false
+      return offset in start..endInclusive
     }
 
     /**
@@ -1324,7 +1326,7 @@ class SegmentedHttpCache(
           val leadHave = store.contiguousFrom(ps2)
           if (leadHave <= 0L) {
             val holeAtPlayhead = ps2
-            if (store.hasInFlightAround(holeAtPlayhead)) {
+            if (hasInFlightAround(holeAtPlayhead)) {
               runCatching { Thread.sleep(20) }
               continue
             }
