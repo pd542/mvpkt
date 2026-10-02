@@ -775,6 +775,27 @@ class SegmentedHttpCache(
     private val inFlightRanges = ConcurrentHashMap<String, CompletableFuture<Boolean>>()
 
     /**
+     * True when some scheduled Range download already covers [offset].
+     *
+     * Used by the stripe filler to tell "another path is fetching the hole the
+     * player is stalled on, so I should yield" apart from "nothing at all is
+     * fetching it, so I must fill it myself". Without that distinction the filler
+     * loops forever yielding to a priority window that nobody is filling, and the
+     * BodyReader eventually aborts on a hole that the network could have served.
+     */
+    private fun hasInFlightAround(offset: Long): Boolean {
+      if (inFlightRanges.isEmpty()) return false
+      for (key in inFlightRanges.keys) {
+        val dash = key.indexOf('-')
+        if (dash <= 0) continue
+        val start = key.substring(0, dash).toLongOrNull() ?: continue
+        val endInclusive = key.substring(dash + 1).toLongOrNull() ?: continue
+        if (offset in start..endInclusive) return true
+      }
+      return false
+    }
+
+    /**
      * Rate limit for the per-iteration / per-request diagnostics.
      *
      * The playback log is written synchronously to a file with a flush on every
@@ -1285,11 +1306,32 @@ class SegmentedHttpCache(
         // Priority window was handled above. Only yield to it here if the playhead
         // itself still has an *unread* leading gap; a merely "sparse but progressing"
         // window must not starve sequential tip fill or we never build a runway.
+        //
+        // But when the playhead has *zero* leading bytes we must not simply `continue`:
+        // step 1 above already tried fillWindowParallel(holeStart, pEnd) and it may have
+        // failed (short 10s deadline vs. a slow origin). Looping back re-runs the same
+        // failing call forever while the reader sits at the hole. That is the
+        // "BodyReader abort ... idle=1201 ok=true writing=true downloaded=<GiB>" stall:
+        // the reader spins on a hole the filler refuses to schedule because it keeps
+        // yielding to the very window it just failed to fill.
+        //
+        // So: only yield if some other path is actually making progress on this hole.
+        // If nothing is in flight for it, fall through and let the stripe schedule
+        // slices that start exactly at the playhead.
         val livePriority = activePriorityWindow()
         if (livePriority != null) {
           val (ps2, _) = livePriority
           val leadHave = store.contiguousFrom(ps2)
-          if (leadHave <= 0L) continue
+          if (leadHave <= 0L) {
+            val holeAtPlayhead = ps2
+            if (store.hasInFlightAround(holeAtPlayhead)) {
+              runCatching { Thread.sleep(20) }
+              continue
+            }
+            // Nothing is fetching the hole the player is stalled on: fill it here
+            // rather than yielding. Anchor the stripe cursor on the playhead.
+            pos = maxOf(pos, holeAtPlayhead)
+          }
         }
 
         // Sliding-window ("pipelined") stripe fill.
