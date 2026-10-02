@@ -351,6 +351,20 @@ class SegmentedHttpCache(
     private const val FILL_ANCHOR_TOLERANCE = 4L * 1024L * 1024L
 
     /**
+     * Reads no larger than this, when they move *backwards*, are treated as container
+     * index/header probes rather than the playback position. libmpv asks for the
+     * Matroska cues with a few KB at a low offset right after a seek; a real media
+     * stream is orders of magnitude larger. See [Session.notePlayhead].
+     */
+    private const val PROBE_READ_MAX_BYTES = 4L * 1024L * 1024L
+
+    /**
+     * A backward "seek" landing this close to byte 0 is a container header read, not
+     * a user seek. Nobody scrubs to the first 16 MiB of a 29 GiB file by accident.
+     */
+    private const val PROBE_HEAD_GUARD_BYTES = 16L * 1024L * 1024L
+
+    /**
      * How far past the produced watermark (see [Session.producedWatermark]) the
      * transcode scheduler may plan.
      *
@@ -920,7 +934,7 @@ class SegmentedHttpCache(
       return min(config.totalSize, from + target)
     }
 
-    fun setPlayheadPriority(start: Long, endExclusive: Long) {
+    fun setPlayheadPriority(start: Long, endExclusive: Long, requestLength: Long = -1L) {
       val s = start.coerceAtLeast(0L)
       val e = min(endExclusive, config.totalSize).coerceAtLeast(s)
       val prevStart = priorityStart.get()
@@ -936,13 +950,11 @@ class SegmentedHttpCache(
       priorityEnd.set(
         if (isNewSeek) e else maxOf(e, prevEnd),
       )
-      // Non-expiring memory of the playhead, for [fillAnchor]. Only moves forward
-      // on sequential reads; a real seek may legitimately move it backwards.
-      if (isNewSeek) {
-        lastPlayheadOffset.set(s)
-      } else {
-        lastPlayheadOffset.set(maxOf(lastPlayheadOffset.get(), s))
-      }
+      // Non-expiring memory of the playhead, for [fillAnchor]. Forward movement is
+      // always taken; backward movement is filtered by [notePlayhead] so that the
+      // container-index probes libmpv issues after a seek cannot drag the anchor
+      // back to the file head. See [notePlayhead] for why that matters.
+      notePlayhead(s, requestLength)
       if (isNewSeek) {
         priorityGen.incrementAndGet()
         log("playhead priority SEEK $s-$e")
@@ -990,6 +1002,50 @@ class SegmentedHttpCache(
      * behind. So keep a separate, non-expiring record of where the player last was.
      */
     private val lastPlayheadOffset = AtomicLong(-1L)
+
+    /**
+     * Apply [start] to [lastPlayheadOffset] without letting metadata probes hijack it.
+     *
+     * Not every Range request is a statement about where the player is. After a seek
+     * to the middle of a file, libmpv keeps issuing short reads for the container
+     * index — `bytes=5624-`, `bytes=660984-`, `bytes=792056-` on a Matroska file —
+     * and each of those lands far *before* the real playback offset. Feeding them
+     * into the anchor dragged it back down to the file head, so `fillAnchor()` saw
+     * "playhead is at 660 KB" and never re-anchored the filler to the 15.5 GB the
+     * player was actually waiting on. The filler then spun near byte 0 for the whole
+     * seek, `demuxCacheSec` sat at 0.0, and playback stalled in a loop.
+     *
+     * A backward jump is therefore only believed when it looks like playback rather
+     * than a probe: it has to come from a read big enough to be a media stream (see
+     * [PROBE_READ_MAX_BYTES]) and not be a tiny address near the container header.
+     * Forward movement — the normal progressive case — is always accepted.
+     */
+    private fun notePlayhead(start: Long, requestLength: Long) {
+      val s = start.coerceAtLeast(0L)
+      val prev = lastPlayheadOffset.get()
+      if (prev < 0L) {
+        lastPlayheadOffset.set(s)
+        return
+      }
+      if (s >= prev) {
+        // Sequential progress (or a forward seek): always trustworthy.
+        lastPlayheadOffset.set(s)
+        return
+      }
+      // Backward. Ignore it when it smells like an index/header probe. A probe is a
+      // short Range request (the caller passes the real length); when the caller has
+      // no length to offer (-1), fall back to the offset test alone.
+      val looksLikeProbeRead = requestLength in 1..PROBE_READ_MAX_BYTES
+      val nearContainerHead = s < PROBE_HEAD_GUARD_BYTES
+      if (looksLikeProbeRead || nearContainerHead) {
+        logThrottled("anchorProbe") {
+          "ignored probe read at $s len=$requestLength (anchor stays $prev)"
+        }
+        return
+      }
+      // A genuine backward seek to a non-trivial offset: believe it.
+      lastPlayheadOffset.set(s)
+    }
 
     private fun activePriorityWindow(): Pair<Long, Long>? {
       val s = priorityStart.get()
@@ -1685,7 +1741,9 @@ class SegmentedHttpCache(
             SEEK_START_BYTES
           }
           val firstSliceEnd = min(to + 1, from + firstSliceBytes)
-          setPlayheadPriority(from, readAheadEnd(from))
+          // Pass the real requested length: it is how the anchor tells a container
+          // index probe (a few KB) from actual playback (a large streaming read).
+          setPlayheadPriority(from, readAheadEnd(from), requestLength = length)
           val pre = ensureRange(from, firstSliceEnd, 8_000L)
           // Per-request line, but mpv issues these in bursts: throttle to one per
           // second so a seek storm does not bury the more useful spin diagnostics.
