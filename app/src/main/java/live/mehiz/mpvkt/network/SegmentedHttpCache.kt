@@ -31,6 +31,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -1182,8 +1183,12 @@ class SegmentedHttpCache(
     fun startBackground(afterOffset: Long) {
       // acceptLoop already started in init.
       if (afterOffset >= config.totalSize) return
+      if (!running.get()) return
       // Stripe filler: sequential tip fill, but always yields to seek priority.
-      serverExecutor.execute { stripeFillLoop(afterOffset) }
+      // Tolerate teardown racing this submission: close() shuts the pool down
+      // without joining this caller, so the execute() below can legally be
+      // rejected. That is a normal shutdown, not an error.
+      runCatching { serverExecutor.execute { stripeFillLoop(afterOffset) } }
       log(
         "background stripe filler from $afterOffset workers=${config.connections} " +
           "chunkKb=${config.chunkBytes / 1024} readAheadMb=${config.readAheadBytes / (1024 * 1024)}",
@@ -1367,9 +1372,17 @@ class SegmentedHttpCache(
       if (store.isFullyCovered(start, endInclusive + 1)) {
         return CompletableFuture.completedFuture(true)
       }
+      if (!running.get()) return CompletableFuture.completedFuture(false)
       val key = "$start-$endInclusive"
-      return inFlightRanges.computeIfAbsent(key) {
-        val future = CompletableFuture<Boolean>()
+      // Do NOT call executor.execute() inside the computeIfAbsent mapping function:
+      // ConcurrentHashMap holds the bin lock while the mapping function runs, so
+      // submitting work there both serializes all scheduling on a hot path and lets
+      // the worker (which calls inFlightRanges.remove(key, ...) in its finally) race
+      // the lock held by this very call. Register the future first, then submit.
+      val future = CompletableFuture<Boolean>()
+      val existing = inFlightRanges.putIfAbsent(key, future)
+      if (existing != null) return existing
+      try {
         executor.execute {
           try {
             future.complete(shouldRun() && downloadRangeBlocking(start, endInclusive))
@@ -1379,8 +1392,16 @@ class SegmentedHttpCache(
             inFlightRanges.remove(key, future)
           }
         }
-        future
+      } catch (e: RejectedExecutionException) {
+        // The session is shutting down (executor.shutdownNow()) while a filler or a
+        // proxy request is still scheduling slices. Nothing is wrong with the
+        // transfer — we are simply being torn down. Complete the future as "no
+        // bytes here" and unregister it so the caller sees a normal miss instead of
+        // the process dying with an unhandled RejectedExecutionException.
+        inFlightRanges.remove(key, future)
+        future.complete(false)
       }
+      return future
     }
 
     private fun tryDownloadOnce(start: Long, endInclusive: Long, retries: Int): Boolean {
