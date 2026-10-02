@@ -386,6 +386,15 @@ class PlayerActivity : AppCompatActivity() {
     )
     val result = accelerator.open(uri)
     return if (result.usedSegmented) {
+      // A session may already be live if startPlayback() was entered twice (e.g. the
+      // system re-delivered the intent and onNewIntent() re-ran the whole pipeline).
+      // Overwriting the field would strand the previous instance: its worker threads,
+      // HTTP connections and localhost ServerSocket stay alive but become unreachable,
+      // so nothing can ever close them. That stranded session keeps downloading against
+      // a PlaySessionId the server has already replaced, while mpv is still reading it
+      // and the *new* session (the one the heartbeat samples) looks perfectly healthy.
+      // Close the old one explicitly before adopting the new one.
+      closePreviousSegmentedCache(reason = "superseded")
       segmentedHttpCache = accelerator
       segmentedSourceUrl = uri
       PlaybackSessionLog.i(
@@ -418,6 +427,24 @@ class PlayerActivity : AppCompatActivity() {
     segmentedHttpCache = null
     segmentedSourceUrl = null
     purgeSegmentedHttpCacheDir()
+  }
+
+  /**
+   * Close a still-live segmented session before it is replaced.
+   *
+   * `clearSegmentedPlaybackCache()` already does this, but it is not on every path that
+   * adopts a new accelerator. This is the narrow guarantee: whatever instance currently
+   * occupies [segmentedHttpCache] gets torn down (threads, connections and ServerSocket),
+   * so a second pass of the playback pipeline can never strand the first session.
+   */
+  private fun closePreviousSegmentedCache(reason: String) {
+    val previous = segmentedHttpCache ?: return
+    PlaybackSessionLog.w("SEG", "closing superseded segmented session reason=$reason")
+    runCatching { previous.close() }
+    if (segmentedHttpCache === previous) {
+      segmentedHttpCache = null
+      segmentedSourceUrl = null
+    }
   }
 
   private fun purgeSegmentedHttpCacheDir() {
